@@ -92,7 +92,7 @@ class BlinkDetector:
     - EXIT 倍以上に戻った状態が EXIT_FRAMES 続いたら終了。その後さらに HOLD 秒は除く
     下を見たときの自然な開きの減少 (普段の 0.85〜0.9 倍程度) では反応しないよう、
     どの閾値もそれより下に置いている。"""
-    ENTER, DROP, DROP_BELOW, EXIT, EXIT_FRAMES, HOLD = 0.72, 0.2, 0.8, 0.8, 2, 0.12
+    ENTER, DROP, DROP_BELOW, EXIT, EXIT_FRAMES, HOLD = 0.78, 0.2, 0.84, 0.84, 2, 0.12   # 実録画で決めた値
 
     def __init__(self):
         self.hist: deque = deque(maxlen=90)

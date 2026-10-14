@@ -26,7 +26,8 @@ KIND_STATIC = 0    # 通常姿勢で点を見つめたサンプル
 KIND_MOTION = 1    # 点を見つめたまま頭を動かしたサンプル
 KIND_PURSUIT = 2   # 動く点を目で追ったサンプル
 
-APPEARANCE_DIM = 16        # 見た目の特徴の主成分の数
+APPEARANCE_DIMS = (16, 32)  # 見た目の特徴の主成分の数の候補 (交差検証で選ぶ)
+APPEARANCE_DIM = 16
 APPEARANCE_MIN_SAMPLES = 200
 
 
@@ -156,8 +157,9 @@ class GazeModel:
         return self.design(X, patches) @ self.coef + self.intercept
 
     @classmethod
-    def fit(cls, X, Y, alpha: float, z0: float, o0: float, patches=None, use_appearance=False) -> "GazeModel":
-        app = AppearancePCA.fit(patches) if use_appearance else None
+    def fit(cls, X, Y, alpha: float, z0: float, o0: float, patches=None, use_appearance=False,
+            k: int = APPEARANCE_DIM) -> "GazeModel":
+        app = AppearancePCA.fit(patches, k) if use_appearance else None
         m = cls(alpha, z0, o0, np.zeros((1, 2)), np.zeros(2), app)
         coef, b = ridge_fit(m.design(X, patches), Y, alpha)
         m.coef, m.intercept = coef, b
@@ -284,22 +286,27 @@ def _axis_err(pred, Y, mask, scale) -> float:
 # 動く点のデータの遅れ補正
 # ---------------------------------------------------------------------------
 def align_pursuit(pred_xy: np.ndarray, t: np.ndarray, track_t: np.ndarray, track_xy: np.ndarray,
-                  max_lag: float = 0.5, step: float = 0.01, outlier: float = 2.5):
+                  max_lag: float = 0.6, step: float = 0.01, outlier: float = 2.5):
     """目は動く点から少し遅れて追う (+ 表示と処理の遅れ)。
-    静止点だけで作ったモデルの予測 pred_xy と、点の軌跡 (track_t, track_xy) を比べて、
-    誤差が最も小さくなる遅れを探す。その遅れ分だけ前の点の位置を正解とし、
-    追いつくための素早い目の動き (サッカード) やまばたき直後など、大きく外れたサンプルは除く。
+    静止点だけで作ったモデルの予測 pred_xy と、点の軌跡 (track_t, track_xy) を比べて遅れを探す。
+    遅れは「予測と点の位置の相関が最も高くなるずれ」で決める。縦は手がかりが弱く相関の山がぼやけるので、
+    横と縦のうち相関の高い (信頼できる) 軸で決める。誤差の中央値で決めるより、モデルの偏りに引きずられない。
+    その遅れ分だけ前の点の位置を正解とし、追いつくための素早い目の動き (サッカード) やまばたき直後など、
+    大きく外れたサンプルは除く。
     返り値: (正解の座標 (N, 2), 使うサンプルの mask, 遅れ秒)"""
-    best = None
-    for lag in np.arange(0.0, max_lag + 1e-9, step):
-        tgt = np.column_stack([np.interp(t - lag, track_t, track_xy[:, k]) for k in (0, 1)])
-        e = np.median(np.linalg.norm(pred_xy - tgt, axis=1))
-        if best is None or e < best[0]:
-            best = (e, lag, tgt)
-    _, lag, tgt = best
+    lags = np.arange(0.0, max_lag + 1e-9, step)
+    corr = np.zeros((len(lags), 2))
+    for i, lag in enumerate(lags):
+        for k in (0, 1):
+            tgt = np.interp(t - lag, track_t, track_xy[:, k])
+            c = np.corrcoef(pred_xy[:, k], tgt)[0, 1] if np.std(tgt) > 0 and np.std(pred_xy[:, k]) > 0 else 0.0
+            corr[i, k] = 0.0 if np.isnan(c) else c
+    axis = int(np.argmax(corr.max(axis=0)))
+    lag = float(lags[int(np.argmax(corr[:, axis]))])
+    tgt = np.column_stack([np.interp(t - lag, track_t, track_xy[:, k]) for k in (0, 1)])
     err = np.linalg.norm(pred_xy - tgt, axis=1)
     keep = err <= outlier * np.median(err)
-    return tgt, keep, float(lag)
+    return tgt, keep, lag
 
 
 def fit_profile(name: str, X: np.ndarray, Y: np.ndarray, groups: np.ndarray,
@@ -331,12 +338,14 @@ def fit_profile(name: str, X: np.ndarray, Y: np.ndarray, groups: np.ndarray,
     sel_groups = passes if (n_passes >= 3 and not np.any(~static)) else groups
 
     A_geo = geometric_features(compact_features(X), z0, o0)
-    candidates = [(False, A_geo)]
+    candidates = [(0, A_geo)]
     if patches is not None and len(patches) >= APPEARANCE_MIN_SAMPLES:
         # 交差検証の中で PCA も学習し直すと遅いので、ここでは全データの PCA を使う
         # (PCA は正解座標を見ないので、評価が甘くなる影響は小さい)
-        pca = AppearancePCA.fit(patches)
-        candidates.append((True, np.hstack([A_geo, pca.transform(patches)])))
+        pca = AppearancePCA.fit(patches, max(APPEARANCE_DIMS))
+        scores = pca.transform(patches)
+        for k in APPEARANCE_DIMS:
+            candidates.append((k, np.hstack([A_geo, scores[:, :k]])))
 
     results = {}
     for use_app, A in candidates:
@@ -347,11 +356,12 @@ def fit_profile(name: str, X: np.ndarray, Y: np.ndarray, groups: np.ndarray,
             if best is None or err < best[0] or np.isnan(best[0]):
                 best = (err, alpha, pred)
         results[use_app] = best
-    use_app = bool(True in results and results[True][0] < results[False][0])
-    err, alpha, pred = results[use_app]
-    gain = results[False][0] - results[True][0] if True in results else 0.0
+    k_best = min(results, key=lambda k: results[k][0])
+    use_app = k_best > 0
+    err, alpha, pred = results[k_best]
+    gain = results[0][0] - min(results[k][0] for k in results if k > 0) if len(results) > 1 else 0.0
 
-    model = GazeModel.fit(X, Y, alpha, z0, o0, patches, use_appearance=use_app)
+    model = GazeModel.fit(X, Y, alpha, z0, o0, patches, use_appearance=use_app, k=k_best or APPEARANCE_DIM)
     allm = np.ones(len(X), bool)
     prof = Profile(name=name, screen_w=screen_w, screen_h=screen_h, model=model,
                    cv_error_px=err,

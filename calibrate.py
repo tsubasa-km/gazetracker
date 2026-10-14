@@ -422,7 +422,7 @@ def draw_gauge(canvas, x, y, length, cur, lo, hi, target, label, active, vertica
     return cov
 
 
-def phase_motion(cam, fx, W, H, points, duration=12.0, gid0=0, max_per_point=80, ref=None):
+def phase_motion(cam, fx, W, H, points, duration=12.0, gid0=0, max_per_point=16, ref=None):
     """各点を見つめたまま頭を動かしてもらい、連続的にサンプルを集める。"""
     S, Y, G = [], [], []
     hs = HeadSmoother(0.4)
@@ -493,7 +493,8 @@ def phase_motion(cam, fx, W, H, points, duration=12.0, gid0=0, max_per_point=80,
         if len(got) < 20:
             print(f"  motion point {i + 1}: サンプル不足 ({len(got)}) スキップ")
             continue
-        # 時間方向に均等に間引く (静止データとの比率を保つため)
+        # 時間方向に均等に間引く。頭を動かしたデータは全体の 15% 程度が最もよかった (実録画での交差検証):
+        # 多すぎると普段の姿勢での縦の精度が落ち、無いと頭を動かしたときに大きくずれる
         idx = np.linspace(0, len(got) - 1, min(max_per_point, len(got))).astype(int)
         for j in idx:
             S.append(got[j])

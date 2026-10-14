@@ -5,7 +5,7 @@
      MIN_FPS 以上出る中で最も解像度の高いモードを選び、その形式を指定して開く。
      例: 多くの USB カメラは 720p を MJPG なら 30fps、非圧縮 (YUY2) なら 10fps で出す。
      形式を指定しないと YUY2 が選ばれて遅くなるので、形式まで指定するのが重要。
-  2. 一覧を返さないカメラ (配信ソフトの仮想カメラなど) は、1080p → 720p → 480p の順に
+  2. 一覧を返さないカメラ (配信ソフトの仮想カメラなど) は、720p → 480p の順に
      実際に開いて fps を測り、MIN_FPS 以上出る最大の解像度を使う。
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ import time
 import cv2
 
 AUTO = (0, 0)            # 解像度の自動選択を表す
-AUTO_LADDER = [(1920, 1080), (1280, 720), (640, 480)]   # 自動のとき上から試す
+AUTO_LADDER = [(1280, 720), (640, 480)]   # 一覧を返さないカメラで、自動のとき上から試す
 MIN_FPS = 20             # これ未満の fps は「出ていない」とみなして次を試す
 
 
@@ -74,7 +74,8 @@ def list_modes(index: int):
     return sorted(modes, key=lambda m: (-m[1] * m[2], -m[3])) or None
 
 
-MAX_PIXELS = 1920 * 1080       # これより大きいと処理が重いだけで精度は上がらない (MediaPipe は顔を 256px 程度に縮める)
+MAX_PIXELS = 1280 * 720        # これより大きいと処理が重いだけで精度は上がらない (MediaPipe は顔を 256px 程度に縮める。
+                               # 実録画で 1080p と 640x480 相当を比べても誤差は同等だった)
 _PREFER = {"NV12": 3, "YUY2": 2, "MJPG": 1}   # 同じ解像度・fps なら展開の軽い非圧縮を優先
 
 
@@ -177,7 +178,7 @@ def probe(index: int):
 
 class Camera:
     def __init__(self, index: int = 0, width: int = 0, height: int = 0, fps: int = 30):
-        """width/height が 0 (自動) なら 1080p → 720p → 480p の順に試し、MIN_FPS 以上出る最大の解像度を使う。
+        """width/height が 0 (自動) なら 720p → 480p の順に試し、MIN_FPS 以上出る最大の解像度を使う。
         指定があればその解像度を要求する (出せなければ近いものになる)。
         実際の値は self.width / self.height / self.fps / self.fourcc で分かる。"""
         self.auto = not (width and height)

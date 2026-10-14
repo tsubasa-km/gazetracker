@@ -42,7 +42,7 @@ def camera_names() -> list[str]:
 
 
 def probe_cameras(max_index: int = 6) -> list[str]:
-    """各カメラが出せる最大解像度 (1080p まで) と fps を調べて一覧にする。"""
+    """各カメラが出せる最大解像度 (720p まで) と fps を調べて一覧にする。"""
     from tracker.camera import probe
     names = camera_names()
     found = []
