@@ -460,7 +460,7 @@ def main():
     ap.add_argument("--passes", type=int, default=1, help="座り直して繰り返す姿勢の数 (1, 3, 5, 7)")
     ap.add_argument("--motion-points", type=int, default=5, help="点を見つめたまま頭を動かす点の数 (0, 5, 9)")
     ap.add_argument("--motion-seconds", type=float, default=12.0, help="1 点あたり頭を動かす秒数")
-    ap.add_argument("--cam-res", default="640x480", help="カメラ解像度 (640x480 / 1280x720)")
+    ap.add_argument("--cam-res", default="auto", help="カメラ解像度 (auto=出せる最大, 1920x1080, 1280x720, 640x480)")
     ap.add_argument("--list-monitors", action="store_true")
     a = ap.parse_args()
 
@@ -474,8 +474,10 @@ def main():
     passes = max(1, min(a.passes, len(PASS_GUIDE)))
     print(f"monitor [{a.monitor}] {W}x{H}, profile '{a.profile}', passes={passes}")
 
-    cw, ch = map(int, a.cam_res.lower().split("x"))
-    cam = Camera(a.camera, cw, ch)
+    from tracker.camera import parse_res
+    cam = Camera(a.camera, *parse_res(a.cam_res))
+    cw, ch = cam.width, cam.height
+    print(f"camera [{a.camera}] {cam.description}")
     fx = FeatureExtractor()
     open_fullscreen(mon)
     try:

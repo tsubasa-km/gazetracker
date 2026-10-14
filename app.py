@@ -40,18 +40,45 @@ def camera_names() -> list[str]:
 
 
 def probe_cameras(max_index: int = 6) -> list[str]:
+    """各カメラが出せる最大解像度 (1080p まで) と fps を調べて一覧にする。"""
+    from tracker.camera import probe
     names = camera_names()
     found = []
     for i in range(max(max_index, len(names))):
         name = names[i] if i < len(names) else None
-        c = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-        ok, f = (c.read() if c.isOpened() else (False, None))
-        c.release()
-        if ok and f is not None:
-            found.append(f"{i}: {name or 'カメラ'} ({f.shape[1]}x{f.shape[0]})")
+        r = probe(i)
+        if r is not None:
+            w, h, fps, fmt = r
+            found.append(f"{i}: {name or 'カメラ'} (最大 {w}x{h} {fps:.0f}fps {fmt})")
         elif name:
             found.append(f"{i}: {name} (映像なし)")
     return found or ["0: (カメラが見つかりません)"]
+
+
+VIRTUAL_CAMERA_WORDS = ("obs", "virtual camera", "castcraft", "screen", "ndi", "xsplit",
+                        "snap camera", "manycam", "mmhmm", "streamlabs")
+
+
+def is_virtual_camera(label: str) -> bool:
+    """配信ソフトの仮想カメラなど、顔を映さないカメラ。スマホ連携 (Windows 仮想カメラ) は実カメラ扱い。"""
+    t = label.lower()
+    if "windows" in t:
+        return False
+    return any(w in t for w in VIRTUAL_CAMERA_WORDS)
+
+
+def pick_camera(labels: list[str]) -> str:
+    """仮想カメラと映像の出ないカメラを除き、解像度が最も高いもの (同じなら番号の小さいもの)。"""
+    import re
+    best, best_px = None, -1
+    for lab in labels:
+        m = re.search(r"最大 (\d+)x(\d+)", lab)
+        if not m or is_virtual_camera(lab):
+            continue
+        px = int(m.group(1)) * int(m.group(2))
+        if px > best_px:
+            best, best_px = lab, px
+    return best or labels[0]
 
 
 def monitor_labels() -> list[str]:
@@ -125,12 +152,7 @@ class App(ctk.CTk):
         self.camera_box.grid(row=r, column=1, sticky="ew", padx=12, pady=4); r += 1
         self.cam_prev_btn = ctk.CTkButton(f, text="このカメラの映像を確認", fg_color="gray30", hover_color="gray20", command=self._toggle_cam_preview)
         self.cam_prev_btn.grid(row=r, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 4)); r += 1
-        ctk.CTkLabel(f, text="右側に映像が出る。自分の顔が正面から映るカメラを選ぶ", font=ctk.CTkFont(size=11), text_color="gray", wraplength=330, justify="left").grid(row=r, column=0, columnspan=2, sticky="w", padx=12); r += 1
-
-        ctk.CTkLabel(f, text="カメラ解像度").grid(row=r, column=0, sticky="w", padx=12, pady=4)
-        self.res_var = ctk.StringVar(value=self.settings.get("res", "640x480"))
-        ctk.CTkSegmentedButton(f, values=["640x480", "1280x720"], variable=self.res_var).grid(row=r, column=1, sticky="w", padx=12, pady=4); r += 1
-        ctk.CTkLabel(f, text="720pで10fps程度しか出ないカメラは640x480にする(30fpsが目安)", font=ctk.CTkFont(size=11), text_color="gray", wraplength=330, justify="left").grid(row=r, column=0, columnspan=2, sticky="w", padx=12); r += 1
+        ctk.CTkLabel(f, text="起動時に自動で選ばれる (配信ソフトの仮想カメラを除き、解像度が最も高いもの)。解像度もカメラのドライバに問い合わせて、20fps 以上出る最大を自動で使う。違うカメラなら選び直し、右側の映像で顔が正面から映るか確認する", font=ctk.CTkFont(size=11), text_color="gray", wraplength=330, justify="left").grid(row=r, column=0, columnspan=2, sticky="w", padx=12); r += 1
 
         ctk.CTkLabel(f, text="キャリブ表示モニター").grid(row=r, column=0, sticky="w", padx=12, pady=4)
         mons = monitor_labels()
@@ -239,8 +261,14 @@ class App(ctk.CTk):
         cams = probe_cameras()
         def apply():
             self.camera_box.configure(values=cams)
-            cur = self.settings.get("camera")
-            self.camera_var.set(cur if cur in cams else cams[0])
+            cur = str(self.settings.get("camera", ""))
+            idx = cur.split(":")[0]
+            match = [c for c in cams if cur and c.split(":")[0] == idx and "映像なし" not in c]
+            if match:
+                self.camera_var.set(match[0])
+            else:
+                self.camera_var.set(pick_camera(cams))
+                self._msg(f"カメラを自動で選びました: {self.camera_var.get()}")
         self.after(0, apply)
 
     # --- カメラ映像の確認 (トラッキングなし) ---
@@ -252,7 +280,8 @@ class App(ctk.CTk):
             self._msg("トラッキング中は右側にそのカメラの映像が出ています")
             return
         idx = self._camera_index()
-        cw, ch = map(int, self.res_var.get().split("x"))
+        from tracker.camera import parse_res
+        cw, ch = parse_res("auto")
         self._cam_opening = True
         self.cam_prev_btn.configure(text="カメラを開いています...")
         self.preview.configure(image="", text="カメラを開いています... (数秒かかります)")
@@ -272,8 +301,17 @@ class App(ctk.CTk):
                 self._cam_opening = False
                 self._cam_preview = cam
                 self.cam_prev_btn.configure(text="映像の確認をやめる")
+                self._msg(f"カメラ {idx}: 実際の映像 {cam.description}" + self._res_warning(cam))
             self.after(0, done)
         threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _res_warning(cam) -> str:
+        if cam.width * cam.height < 1280 * 720:
+            return "。高解像度で取れていません。カメラ側の設定や、他のアプリ (OBS など) が同じカメラを使っていないか確認してください"
+        if cam.fps < 20:
+            return "。fps が低いので、解像度を下げるか照明を明るくしてください"
+        return ""
 
     def _stop_cam_preview(self):
         self._cam_opening = False
@@ -359,7 +397,7 @@ class App(ctk.CTk):
         self._stop_cam_preview()
         prof = self.profile_var.get().strip() or "default"
         cmd = subcommand("calibrate", "--profile", prof, "--monitor", str(self._monitor_index()),
-                         "--camera", str(self._camera_index()), "--passes", self.passes_var.get(), "--motion-points", self.motion_var.get(), "--cam-res", self.res_var.get())
+                         "--camera", str(self._camera_index()), "--passes", self.passes_var.get(), "--motion-points", self.motion_var.get(), "--cam-res", "auto")
         env = dict(os.environ, PYTHONIOENCODING="utf-8")
         self.calib_proc = subprocess.Popen(cmd, cwd=str(APP_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                            text=True, encoding="utf-8", errors="replace", env=env,
@@ -404,7 +442,8 @@ class App(ctk.CTk):
             self._msg(f"プロファイル '{prof}' がありません。先にキャリブレーションしてください")
             return
         self._stop_cam_preview()
-        cw, ch = map(int, self.res_var.get().split("x"))
+        from tracker.camera import parse_res
+        cw, ch = parse_res("auto")
         self.engine = GazeEngine(prof, self._camera_index(), log=self.log_var.get(),
                                  hotkey=self.hotkey_var.get().strip().lower(), reset_hotkey=self.reset_hotkey_var.get().strip().lower(),
                                  min_cutoff=self.cutoff_var.get(), beta=self.beta_var.get(), cam_w=cw, cam_h=ch)
@@ -440,7 +479,8 @@ class App(ctk.CTk):
                     f"実行中  {st.fps:5.1f} fps   顔: {'OK' if st.face else 'NG'}   {g}\n"
                     f"OBS 接続数: {st.clients}   プロファイル: {st.profile} (誤差 {st.cv_error_px:.0f}px)\n"
                     f"補正: {'収集中...' if st.recentering else (f'x {st.offset_x * 100:+.1f}%  y {st.offset_y * 100:+.1f}%' if (st.offset_x or st.offset_y) else 'なし')}"
-                    f"   ログ: {st.log_path or 'なし'}"))
+                    f"   カメラ: {st.cam_desc or '-'}\n"
+                    f"ログ: {st.log_path or 'なし'}"))
                 fr = self.engine.latest_frame()
                 if fr is not None:
                     self._show_frame(fr)
@@ -475,7 +515,7 @@ class App(ctk.CTk):
 
     def _save_settings(self):
         d = {"profile": self.profile_var.get(), "camera": self.camera_var.get(), "monitor": self.monitor_var.get(),
-             "passes": self.passes_var.get(), "motion_points": self.motion_var.get(), "res": self.res_var.get(), "log": self.log_var.get(), "min_cutoff": self.cutoff_var.get(),
+             "passes": self.passes_var.get(), "motion_points": self.motion_var.get(), "log": self.log_var.get(), "min_cutoff": self.cutoff_var.get(),
              "beta": self.beta_var.get(), "color": self.color_var.get(), "size": self.size_var.get(),
              "trail": self.trail_var.get(), "hotkey": self.hotkey_var.get(), "reset_hotkey": self.reset_hotkey_var.get()}
         try:

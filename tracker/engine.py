@@ -83,6 +83,7 @@ class Status:
     y: float = 0.0
     clients: int = 0
     log_path: str = ""
+    cam_desc: str = ""          # 実際に取れたカメラの解像度・fps・形式
     started: bool = False      # カメラとモデルの初期化が終わったか
     error: str = ""
     profile: str = ""
@@ -95,7 +96,7 @@ class Status:
 class GazeEngine:
     def __init__(self, profile: str, camera: int = 0, ws_port: int = 8765, http_port: int = 8766,
                  log: bool = True, min_cutoff: float = 1.0, beta: float = 0.05,
-                 cam_w: int = 640, cam_h: int = 480, hotkey: str = "f8", reset_hotkey: str = "f9",
+                 cam_w: int = 0, cam_h: int = 0, hotkey: str = "f8", reset_hotkey: str = "f9",
                  beep: bool = True):
         self.profile_name = profile
         self.hotkey, self.reset_hotkey, self.beep = hotkey, reset_hotkey, beep
@@ -229,6 +230,7 @@ class GazeEngine:
                 st.log_path = str(path)
 
             cam = Camera(self.camera_index, self.cam_w, self.cam_h)
+            st.cam_desc = cam.description
             fx = FeatureExtractor()
             st.started = True
             self._fx = OneEuro(self.min_cutoff, self.beta)

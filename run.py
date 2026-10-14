@@ -25,11 +25,12 @@ def main():
     ap.add_argument("--preview", action="store_true", help="カメラ映像と推定点を表示")
     ap.add_argument("--min-cutoff", type=float, default=1.0, help="平滑化: 小さいほど滑らか (遅延増)")
     ap.add_argument("--beta", type=float, default=0.05, help="平滑化: 大きいほど速い動きに追従")
-    ap.add_argument("--cam-res", default="640x480", help="カメラ解像度 (640x480 / 1280x720)")
+    ap.add_argument("--cam-res", default="auto", help="カメラ解像度 (auto=出せる最大, 1920x1080, 1280x720, 640x480)")
     ap.add_argument("--hotkey", default="f8", help="ワンキー補正のキー (画面中央を見ながら押す)")
     ap.add_argument("--reset-hotkey", default="f9", help="補正解除のキー")
     a = ap.parse_args()
-    cw, ch = map(int, a.cam_res.lower().split("x"))
+    from tracker.camera import parse_res
+    cw, ch = parse_res(a.cam_res)
 
     if not (PROFILE_DIR / f"{a.profile}.json").exists():
         print(f"プロファイル '{a.profile}' がありません。先に calibrate.py --profile {a.profile} を実行してください。")
