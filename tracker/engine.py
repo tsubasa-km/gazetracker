@@ -251,7 +251,7 @@ class GazeEngine:
                 msg = {"t": int(ts * 1000), "valid": valid, "blink": bool(s.blink),
                        "face": bool(s.ok), "fps": round(st.fps, 1)}
                 if valid:
-                    px, py = prof.predict(head_smooth(s.feat))
+                    px, py = prof.predict(head_smooth(s.feat), s.patches)
                     if st.recentering:
                         self._recenter_buf.append((px, py))
                     rx, ry = px + self._offset[0], py + self._offset[1]

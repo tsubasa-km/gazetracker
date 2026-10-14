@@ -49,6 +49,24 @@ def main():
         th = threading.Thread(target=lambda: res.update(names=len(camera_names()), modes=list_modes(0) is not None))
         th.start()
         th.join()
+        # 録画 (FFmpeg なしの MJPEG 書き出し) ができること
+        import shutil
+        from tracker.recorder import Recorder
+        rec_ok = False
+        try:
+            r = Recorder(1920, 1080, "selftest", (640, 480), fps=30)
+            for i in range(5):
+                r.add(np.zeros((480, 640, 3), np.uint8), 1000.0 + i, "selftest")
+            d = r.close()
+            rec_ok = (d / "video.avi").stat().st_size > 1000
+            shutil.rmtree(d, ignore_errors=True)
+            try:
+                d.parent.rmdir()
+            except OSError:
+                pass
+        except Exception as e:
+            print("record error:", e)
+        print(f"selftest record={rec_ok}")
         print(f"selftest ok model={MODEL_PATH.exists()} engine_started={st.started} fps={st.fps:.1f} "
               f"error={st.error!r} cameras={len(camera_names())} cameras_thread={res.get('names')} "
               f"modes={res.get('modes')} cam={st.cam_desc!r} app_dir={APP_DIR}")

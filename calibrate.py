@@ -24,10 +24,16 @@ from screeninfo import get_monitors
 from tracker.camera import Camera
 from tracker.features import IDX, FeatureExtractor, HeadSmoother, draw_face
 from tracker.filters import OneEuro
-from tracker.model import KIND_MOTION, KIND_STATIC, fit_profile
+from tracker.model import KIND_MOTION, KIND_PURSUIT, KIND_STATIC, GazeModel, align_pursuit, fit_profile
+from tracker.recorder import NullRecorder, Recorder
 from tracker.paths import PROFILE_DIR
 
 WIN = "gaze-calibration"
+REC = NullRecorder()          # --record のときに Recorder に差し替える
+
+STATIC_GRID = 5               # 1 周目の静止点: 5x5。縦の段数を増やして点ごとの偏りを平均しやすくする
+STATIC_SETTLE, STATIC_COLLECT = 0.8, 0.6   # 1 点あたり: 視線が落ち着くまで待つ秒数 / 集める秒数
+PURSUIT_SEGMENT = 2.0         # 動く点のデータを交差検証用に区切る秒数
 BG = (20, 20, 20)
 WHITE, GRAY, GREEN, RED, ORANGE = (230, 230, 230), (140, 140, 140), (80, 220, 0), (255, 60, 60), (255, 179, 71)
 
@@ -138,7 +144,7 @@ def wait_key(ms=1):
     return cv2.waitKey(ms) & 0xFF
 
 
-def phase_preview(cam, fx, W, H, passes, motion_n=0, motion_sec=12.0):
+def phase_preview(cam, fx, W, H, passes, motion_n=0, motion_sec=12.0, pursuit_sec=0.0):
     """カメラ映像を見せて顔検出を確認する。SPACE で開始, ESC で中止。"""
     while True:
         frame, ts = cam.read()
@@ -150,9 +156,10 @@ def phase_preview(cam, fx, W, H, passes, motion_n=0, motion_sec=12.0):
         draw_face(small, s, pw / frame.shape[1])
         x0, y0 = (W - pw) // 2, (H - ph) // 2 - 40
         canvas[y0:y0 + ph, x0:x0 + pw] = small
-        n_pts = len(grid_points(4)) + (passes - 1) * len(grid_points(3))
-        secs = n_pts * 2 + motion_n * (motion_sec + 2)
-        plan = f"{passes} つの姿勢で {n_pts} 点" + (f" + 頭を動かしながら {motion_n} 点" if motion_n else "")
+        n_pts = len(grid_points(STATIC_GRID)) + (passes - 1) * len(grid_points(3))
+        secs = n_pts * (STATIC_SETTLE + STATIC_COLLECT + 0.1) + pursuit_sec + 5 + motion_n * (motion_sec + 2)
+        plan = f"{n_pts} 点" + (f" + 動く点 {pursuit_sec:.0f} 秒" if pursuit_sec else "") + \
+            (f" + 頭を動かしながら {motion_n} 点" if motion_n else "") + (f" ({passes} 姿勢)" if passes > 1 else "")
         draw_texts(canvas, [
             ("顔・目・頭の向きを検出しています" if s.ok else "顔が検出できません。カメラの向きや明るさを確認してください",
              y0 - 56, 34, GREEN if s.ok else RED),
@@ -223,22 +230,24 @@ def show_pass_guide(cam, fx, W, H, p, passes, ref=None):
             return True
 
 
-def phase_collect(cam, fx, W, H, passes, settle=1.2, collect=1.0):
-    X, Y, G, P, RL, RM = [], [], [], [], [], []
+def phase_collect(cam, fx, W, H, passes, settle=STATIC_SETTLE, collect=STATIC_COLLECT):
+    """静止点を順に見つめてもらう。返り値: (サンプルの list, ラベルの dict of list, 基準姿勢)"""
+    S, Y, G, P = [], [], [], []
     gid = 0
     ref = None
     for p in range(passes):
-        if p == 1 and X:
-            ref = np.median(np.array(X), axis=0)      # 1 周目の頭の位置を基準にする
+        if p == 1 and S:
+            ref = np.median(np.array([x.feat for x in S]), axis=0)      # 1 周目の頭の位置を基準にする
         if not show_pass_guide(cam, fx, W, H, p, passes, ref):
             return None
-        order = grid_points(4) if p == 0 else grid_points(3)
+        order = grid_points(STATIC_GRID) if p == 0 else grid_points(3)
         random.shuffle(order)
         order.sort(key=lambda q: 0 if q == (0.5, 0.5) else 1)    # 中心から始めると目が慣れやすい
         for i, (nx, ny) in enumerate(order):
             cx, cy = int(nx * W), int(ny * H)
             t0 = time.time()
-            got, raw = [], []
+            got = []
+            last = None
             while True:
                 el = time.time() - t0
                 canvas = np.full((H, W, 3), BG, np.uint8)
@@ -254,32 +263,97 @@ def phase_collect(cam, fx, W, H, passes, settle=1.2, collect=1.0):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 120, 120), 1, cv2.LINE_AA)
                 cv2.imshow(WIN, canvas)
                 frame, ts = cam.read()
-                s = fx.process(frame, int(ts * 1000))
-                if el >= settle and s.ok and not s.blink:
-                    got.append(s.feat)
-                    raw.append((s.raw_L, s.raw_M))
-                if el >= settle + collect and len(got) >= 8:
+                if ts != last:          # 同じフレームを 2 回数えない
+                    last = ts
+                    s = fx.process(frame, int(ts * 1000))
+                    collecting = el >= settle
+                    REC.add(frame, ts, "static", (nx, ny), gid=gid, collecting=collecting, face=bool(s.ok))
+                    if collecting and s.ok and not s.blink:
+                        got.append(s)
+                if el >= settle + collect and len(got) >= 6:
                     break
                 if el > settle + collect + 3:   # 顔が取れない場合の打ち切り
                     break
                 if wait_key(1) == 27:
                     return None
-            if len(got) < 5:
+            if len(got) < 4:
                 print(f"  pass {p + 1} point {i + 1}: サンプル不足 ({len(got)}) スキップ")
                 continue
-            # 各点は中央値 1 サンプル + 個々のサンプルの両方を入れる (外れ値の影響を抑える)
-            med = np.median(np.array(got), axis=0)
-            mid = raw[len(raw) // 2]
-            for f, r in [(med, mid)] * 4 + list(zip(got, raw)):
-                X.append(f)
+            for x in got:
+                S.append(x)
                 Y.append((nx, ny))
                 G.append(gid)
                 P.append(p)
-                RL.append(r[0]); RM.append(r[1])
             gid += 1
-    if ref is None and X:
-        ref = np.median(np.array(X), axis=0)
-    return np.array(X), np.array(Y), np.array(G), np.array(P), ref, np.array(RL), np.array(RM)
+    if ref is None and S:
+        ref = np.median(np.array([x.feat for x in S]), axis=0)
+    return S, {"Y": Y, "G": G, "P": P}, ref
+
+
+def pursuit_path(t: float):
+    """動く点の軌跡 (正規化座標)。周期の違う 2 つの正弦波 (リサージュ曲線) で画面全体をなめらかになぞる。
+    速さは最大で画面幅の 0.2 倍/秒程度 (目で無理なく追える速さ)。"""
+    return (0.5 + 0.42 * np.sin(2 * np.pi * t / 13.0),
+            0.5 + 0.40 * np.sin(2 * np.pi * t / 9.0))
+
+
+def show_pursuit_guide(cam, fx, W, H, duration):
+    while True:
+        frame, ts = cam.read()
+        s = fx.process(frame, int(ts * 1000))
+        canvas = np.full((H, W, 3), BG, np.uint8)
+        draw_texts(canvas, [
+            ("次は、動く点を目で追います", 120, 56, ORANGE),
+            (f"{duration:.0f} 秒間、点がゆっくり画面全体を動きます", 215, 32, WHITE),
+            ("頭は動かさず、目だけで点を追い続けてください", 265, 30, WHITE),
+            ("上下の位置をたくさん集めて、縦方向のずれを減らします", 315, 26, GRAY),
+            ("顔を検出しています" if s.ok else "顔が検出できません", H // 2 + 60, 28, GREEN if s.ok else RED),
+            ("SPACE: 開始    ESC: 中止", H - 90, 30, GRAY),
+        ])
+        cv2.imshow(WIN, canvas)
+        k = wait_key(1)
+        if k == 27:
+            return False
+        if k == 32 and s.ok:
+            return True
+
+
+def phase_pursuit(cam, fx, W, H, duration=40.0, lead_in=1.5):
+    """動く点を目で追ってもらう。点は最初 lead_in 秒止まってから動き出す。
+    返り値: (サンプル, 撮影時刻, 軌跡の時刻, 軌跡の座標) か None (中止)。"""
+    samples, times, track_t, track_xy = [], [], [], []
+    t_start = time.time() + lead_in
+    last = None
+    while True:
+        now = time.time()
+        el = now - t_start
+        if el >= duration:
+            break
+        canvas = np.full((H, W, 3), BG, np.uint8)
+        nx, ny = pursuit_path(max(el, 0.0))
+        cx, cy = int(nx * W), int(ny * H)
+        cv2.circle(canvas, (cx, cy), 16, (0, 200, 255), 2, cv2.LINE_AA)
+        cv2.circle(canvas, (cx, cy), 5, (0, 0, 255), -1, cv2.LINE_AA)
+        bar = int(W * min(max(el, 0) / duration, 1))
+        cv2.rectangle(canvas, (0, H - 6), (bar, H), (0, 200, 255), -1)
+        if el < 0:
+            draw_texts(canvas, [("この点を目で追ってください", max(cy - 90, 20), 32, ORANGE)])
+        cv2.imshow(WIN, canvas)
+        # 表示した時刻と位置を軌跡として残す (撮影時刻との対応は後で遅れ込みで合わせる)
+        track_t.append(now)
+        track_xy.append((nx, ny))
+        frame, ts = cam.read()
+        if ts != last:
+            last = ts
+            s = fx.process(frame, int(ts * 1000))
+            tgt = pursuit_path(max(ts - t_start, 0.0))
+            REC.add(frame, ts, "pursuit", tgt, face=bool(s.ok), moving=bool(ts >= t_start))
+            if ts >= t_start + 0.5 and s.ok and not s.blink:      # 動き出してすぐは目が追いついていない
+                samples.append(s)
+                times.append(ts)
+        if wait_key(1) == 27:
+            return None
+    return samples, np.array(times), np.array(track_t), np.array(track_xy)
 
 
 MOTION_STEPS = [   # (開始秒, 指示)
@@ -346,18 +420,23 @@ def draw_gauge(canvas, x, y, length, cur, lo, hi, target, label, active, vertica
 
 def phase_motion(cam, fx, W, H, points, duration=12.0, gid0=0, max_per_point=80, ref=None):
     """各点を見つめたまま頭を動かしてもらい、連続的にサンプルを集める。"""
-    X, Y, G, RL, RM = [], [], [], [], []
+    S, Y, G = [], [], []
     hs = HeadSmoother(0.4)
     for i, (nx, ny) in enumerate(points):
         cx, cy = int(nx * W), int(ny * H)
-        got, raw = [], []
+        got = []
         t0 = None
+        last = None
         rng = {"yaw": [0.0, 0.0], "pitch": [0.0, 0.0], "z": [0.0, 0.0]}
         cur = {"yaw": 0.0, "pitch": 0.0, "z": 0.0}
         base = None
+        s_prev = None
         while True:
             frame, ts = cam.read()
-            s = fx.process(frame, int(ts * 1000))
+            new = ts != last
+            last = ts
+            s = fx.process(frame, int(ts * 1000)) if new or s_prev is None else s_prev
+            s_prev = s
             canvas = np.full((H, W, 3), BG, np.uint8)
             if t0 is None:
                 # 顔を検出して 1 秒待ってから開始
@@ -373,9 +452,10 @@ def phase_motion(cam, fx, W, H, points, duration=12.0, gid0=0, max_per_point=80,
                 cv2.ellipse(canvas, (cx, cy), (34, 34), -90, 0, int(360 * min(el / duration, 1)), (0, 200, 255), 3, cv2.LINE_AA)
                 step_i = max(k for k, (t0s, _) in enumerate(MOTION_STEPS) if el >= t0s)
                 step = MOTION_STEPS[step_i][1]
-                if s.ok and not s.blink:
-                    got.append(s.feat)
-                    raw.append((s.raw_L, s.raw_M))
+                if new and s.ok and not s.blink:
+                    got.append(s)
+                if new:
+                    REC.add(frame, ts, "motion", (nx, ny), gid=gid0 + i, face=bool(s.ok))
             else:
                 step = "顔を検出したら始まります" if not s.ok else "まもなく開始"
             if s.ok:
@@ -411,11 +491,10 @@ def phase_motion(cam, fx, W, H, points, duration=12.0, gid0=0, max_per_point=80,
         # 時間方向に均等に間引く (静止データとの比率を保つため)
         idx = np.linspace(0, len(got) - 1, min(max_per_point, len(got))).astype(int)
         for j in idx:
-            X.append(got[j])
+            S.append(got[j])
             Y.append((nx, ny))
             G.append(gid0 + i)
-            RL.append(raw[j][0]); RM.append(raw[j][1])
-    return np.array(X), np.array(Y), np.array(G), np.array(RL), np.array(RM)
+    return S, Y, G
 
 
 def phase_verify(cam, fx, W, H, prof):
@@ -431,14 +510,18 @@ def phase_verify(cam, fx, W, H, prof):
         for nx, ny in pts:
             cv2.circle(canvas, (int(nx * W), int(ny * H)), 6, (90, 90, 90), 1, cv2.LINE_AA)
         if s.ok and not s.blink:
-            x, y = prof.predict(hs(s.feat))
+            x, y = prof.predict(hs(s.feat), s.patches)
             x, y = fxf(x, ts), fyf(y, ts)
             cv2.circle(canvas, (int(x * W), int(y * H)), 18, (0, 200, 255), 3, cv2.LINE_AA)
         lines = [(f"推定誤差の目安: 約 {prof.cv_error_px:.0f} px (画面幅の {pct:.1f}%)  {grade}", 40, 32, WHITE)]
-        sub = f"通常姿勢 約 {prof.same_pose_error_px:.0f} px"
+        sub = f"横 約 {prof.error_x_px:.0f} px  縦 約 {prof.error_y_px:.0f} px   |   静止点 約 {prof.same_pose_error_px:.0f} px"
+        if not np.isnan(prof.pursuit_error_px):
+            sub += f"  動く点 約 {prof.pursuit_error_px:.0f} px"
         if prof.n_motion_points > 0 and not np.isnan(prof.motion_error_px):
-            sub += f"  /  頭を動かしたとき 約 {prof.motion_error_px:.0f} px"
+            sub += f"  頭を動かしたとき 約 {prof.motion_error_px:.0f} px"
         lines.append((sub, 90, 26, GRAY))
+        lines.append((("目の画像の特徴: 使用" if prof.uses_appearance else "目の画像の特徴: 不使用")
+                      + f" (効果 {prof.appearance_gain_px:+.0f} px)", 130, 22, GRAY))
         lines.append(("画面のあちこちを見て、頭も少し動かして確かめてください", H - 130, 28, GRAY))
         lines.append(("SPACE: 保存    R: やり直し    ESC: 破棄", H - 80, 30, WHITE))
         draw_texts(canvas, lines)
@@ -460,6 +543,8 @@ def main():
     ap.add_argument("--passes", type=int, default=1, help="座り直して繰り返す姿勢の数 (1, 3, 5, 7)")
     ap.add_argument("--motion-points", type=int, default=5, help="点を見つめたまま頭を動かす点の数 (0, 5, 9)")
     ap.add_argument("--motion-seconds", type=float, default=12.0, help="1 点あたり頭を動かす秒数")
+    ap.add_argument("--pursuit-seconds", type=float, default=40.0, help="動く点を目で追う秒数 (0 で省略)")
+    ap.add_argument("--record", action="store_true", help="検証用にカメラ映像と点の位置を recordings/ に録画する")
     ap.add_argument("--cam-res", default="auto", help="カメラ解像度 (auto=出せる最大, 1920x1080, 1280x720, 640x480)")
     ap.add_argument("--list-monitors", action="store_true")
     a = ap.parse_args()
@@ -479,51 +564,98 @@ def main():
     cw, ch = cam.width, cam.height
     print(f"camera [{a.camera}] {cam.description}")
     fx = FeatureExtractor()
+    global REC
+    if a.record:
+        REC = Recorder(W, H, cam.description, (cam.width, cam.height), fps=cam.fps,
+                       extra={"profile": a.profile, "pursuit": "0.5+0.42sin(2πt/13), 0.5+0.40sin(2πt/9)"})
+        print(f"録画: {REC.dir}")
     open_fullscreen(mon)
     try:
         while True:
-            if not phase_preview(cam, fx, W, H, passes, a.motion_points, a.motion_seconds):
-                print("中止")
-                return
-            data = phase_collect(cam, fx, W, H, passes)
-            if data is None:
-                print("中止")
-                return
-            X, Y, G, P, ref, RL, RM = data
-            K = np.full(len(X), KIND_STATIC)
-            mpts = motion_points(a.motion_points)
-            if mpts:
-                if not show_motion_guide(cam, fx, W, H, len(mpts), a.motion_seconds):
-                    print("中止")
-                    return
-                m = phase_motion(cam, fx, W, H, mpts, a.motion_seconds, gid0=int(G.max()) + 1, ref=ref)
-                if m is None:
-                    print("中止")
-                    return
-                Xm, Ym, Gm, RLm, RMm = m
-                if len(Xm):
-                    X = np.vstack([X, Xm]); Y = np.vstack([Y, Ym]); G = np.concatenate([G, Gm])
-                    RL = np.concatenate([RL, RLm]); RM = np.concatenate([RM, RMm])
-                    P = np.concatenate([P, np.full(len(Xm), -1)]); K = np.concatenate([K, np.full(len(Xm), KIND_MOTION)])
-            print(f"samples={len(X)}, points={len(np.unique(G))}, passes={len(np.unique(P[K == KIND_STATIC]))}, motion={int((K == KIND_MOTION).sum())}")
-            prof = fit_profile(a.profile, X, Y, G, W, H, P, K)
-            print(f"交差検証誤差: {prof.cv_error_px:.1f} px (通常姿勢 {prof.same_pose_error_px:.1f} px, 頭を動かしたとき {prof.motion_error_px:.1f} px, 除外 {getattr(prof, 'n_dropped', 0)} サンプル)")
-            r = phase_verify(cam, fx, W, H, prof)
-            if r == "save":
-                prof.save()
-                # 生データも残す (モデルの調整や再学習に使う)
-                np.savez_compressed(PROFILE_DIR / f"{a.profile}_calib.npz", X=X, Y=Y, G=G, P=P, K=K, L=RL, M=RM,
-                                    screen=np.array([W, H]), cam=np.array([cw, ch]),
-                                    ref=ref if ref is not None else np.zeros(0))
-                print(f"保存しました: {a.profile}")
-                return
-            if r == "discard":
-                print("破棄しました")
+            r = run_once(cam, fx, W, H, cw, ch, passes, a)
+            if r in ("save", "discard", "cancel"):
+                print({"save": f"保存しました: {a.profile}", "discard": "破棄しました", "cancel": "中止"}[r])
                 return
     finally:
         cv2.destroyAllWindows()
         fx.close()
         cam.close()
+        d = REC.close()
+        if d is not None:
+            print(f"録画を保存しました: {d}")
+
+
+def stack(samples):
+    """Sample の list → 特徴量・生ランドマーク・頭部姿勢・目のパッチの配列"""
+    return (np.array([x.feat for x in samples]), np.array([x.raw_L for x in samples]),
+            np.array([x.raw_M for x in samples]), np.array([x.patches for x in samples]))
+
+
+def run_once(cam, fx, W, H, cw, ch, passes, a):
+    if not phase_preview(cam, fx, W, H, passes, a.motion_points, a.motion_seconds, a.pursuit_seconds):
+        return "cancel"
+    data = phase_collect(cam, fx, W, H, passes)
+    if data is None:
+        return "cancel"
+    S, lab, ref = data
+    Y, G, P = list(lab["Y"]), list(lab["G"]), list(lab["P"])
+    K = [KIND_STATIC] * len(S)
+    T = [float("nan")] * len(S)
+    lag = float("nan")
+
+    # 動く点: 静止点だけのモデルで遅れを推定し、遅れ分ずらした点の位置を正解にする
+    if a.pursuit_seconds > 0:
+        if not show_pursuit_guide(cam, fx, W, H, a.pursuit_seconds):
+            return "cancel"
+        pr = phase_pursuit(cam, fx, W, H, a.pursuit_seconds)
+        if pr is None:
+            return "cancel"
+        Sp, tp, track_t, track_xy = pr
+        if len(Sp) >= 30 and len(S) >= 10:
+            Xs = np.array([x.feat for x in S])
+            base = GazeModel.fit(Xs, np.array(Y, float), 1.0, *_z0o0(Xs))
+            pred = base.predict(np.array([x.feat for x in Sp]))
+            tgt, keep, lag = align_pursuit(pred, tp, track_t, track_xy)
+            g0 = max(G) + 1 if G else 0
+            seg = ((tp - tp[0]) // PURSUIT_SEGMENT).astype(int)
+            for x, yv, k, sg, t in zip(Sp, tgt, keep, seg, tp):
+                if k:
+                    S.append(x); Y.append(tuple(yv)); G.append(g0 + int(sg)); P.append(-1)
+                    K.append(KIND_PURSUIT); T.append(float(t))
+            print(f"動く点: {len(Sp)} サンプル中 {int(keep.sum())} を使用、遅れ {lag * 1000:.0f} ms")
+
+    mpts = motion_points(a.motion_points)
+    if mpts:
+        if not show_motion_guide(cam, fx, W, H, len(mpts), a.motion_seconds):
+            return "cancel"
+        m = phase_motion(cam, fx, W, H, mpts, a.motion_seconds, gid0=max(G) + 1, ref=ref)
+        if m is None:
+            return "cancel"
+        Sm, Ym, Gm = m
+        S += Sm; Y += Ym; G += Gm; P += [-1] * len(Sm); K += [KIND_MOTION] * len(Sm); T += [float("nan")] * len(Sm)
+
+    X, RL, RM, PA = stack(S)
+    Y, G, P, K, T = np.array(Y, float), np.array(G), np.array(P), np.array(K), np.array(T)
+    print(f"samples={len(X)}, points={len(np.unique(G))}, static={int((K == KIND_STATIC).sum())}, "
+          f"pursuit={int((K == KIND_PURSUIT).sum())}, motion={int((K == KIND_MOTION).sum())}")
+    prof = fit_profile(a.profile, X, Y, G, W, H, P, K, patches=PA, pursuit_lag_s=lag)
+    print(f"交差検証誤差: {prof.cv_error_px:.1f} px (横 {prof.error_x_px:.1f} / 縦 {prof.error_y_px:.1f}, "
+          f"静止 {prof.same_pose_error_px:.1f}, 動く点 {prof.pursuit_error_px:.1f}, 頭を動かしたとき {prof.motion_error_px:.1f}, "
+          f"目の画像 {'使用' if prof.uses_appearance else '不使用'} 効果 {prof.appearance_gain_px:+.1f} px, "
+          f"除外 {getattr(prof, 'n_dropped', 0)} サンプル)")
+    r = phase_verify(cam, fx, W, H, prof)
+    if r == "save":
+        prof.save()
+        # 生データも残す (モデルの調整や再学習に使う)
+        np.savez_compressed(PROFILE_DIR / f"{a.profile}_calib.npz", X=X, Y=Y, G=G, P=P, K=K, T=T, L=RL, M=RM, PA=PA,
+                            screen=np.array([W, H]), cam=np.array([cw, ch]), lag=np.array(lag),
+                            ref=ref if ref is not None else np.zeros(0))
+    return r
+
+
+def _z0o0(X):
+    from tracker.model import _scale_params
+    return _scale_params(X)
 
 
 if __name__ == "__main__":

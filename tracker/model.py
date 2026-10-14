@@ -2,6 +2,12 @@
 
 回帰は Ridge 回帰と、注視点ごとに分けた交差検証だけなので numpy で実装している
 (scikit-learn と SciPy を同梱すると exe が 80MB ほど大きくなるため)。
+
+入力は 2 種類:
+  - ランドマーク特徴: 虹彩位置・まぶたの開き・頭部姿勢 (geometric_features)
+  - 見た目の特徴 (任意): 目の周りの画像を主成分分析 (PCA) で圧縮したもの。
+    ランドマークでは取りにくい、まぶたの形や白目の見え方といった縦方向の手がかりを拾う。
+    キャリブレーションの交差検証で誤差が下がるときだけ使う。
 """
 from __future__ import annotations
 
@@ -16,8 +22,12 @@ from .paths import PROFILE_DIR
 
 PROFILE_VERSION = 4   # 4: モデルを JSON で保存 (3 までは scikit-learn の joblib)
 
-KIND_STATIC = 0   # 通常姿勢で点を見つめたサンプル
-KIND_MOTION = 1   # 点を見つめたまま頭を動かしたサンプル
+KIND_STATIC = 0    # 通常姿勢で点を見つめたサンプル
+KIND_MOTION = 1    # 点を見つめたまま頭を動かしたサンプル
+KIND_PURSUIT = 2   # 動く点を目で追ったサンプル
+
+APPEARANCE_DIM = 16        # 見た目の特徴の主成分の数
+APPEARANCE_MIN_SAMPLES = 200
 
 
 def geometric_features(C: np.ndarray, z0: float = 40.0, o0: float = 0.35) -> np.ndarray:
@@ -45,6 +55,42 @@ def geometric_features(C: np.ndarray, z0: float = 40.0, o0: float = 0.35) -> np.
         yaw / 0.2, pitch / 0.2,
     ]
     return np.column_stack(cols)
+
+
+# ---------------------------------------------------------------------------
+# 見た目の特徴 (目のパッチの PCA)
+# ---------------------------------------------------------------------------
+def patch_vectors(patches: np.ndarray) -> np.ndarray:
+    """(N, 2, h, w) uint8 → (N, 2*h*w)。目ごとに明るさとコントラストをそろえる (照明の変化に強くする)。"""
+    P = np.asarray(patches, dtype=np.float32).reshape(len(patches), 2, -1)
+    P = (P - P.mean(axis=2, keepdims=True)) / (P.std(axis=2, keepdims=True) + 1e-3)
+    return P.reshape(len(patches), -1)
+
+
+@dataclass
+class AppearancePCA:
+    mean: np.ndarray        # (D,)
+    comp: np.ndarray        # (k, D)
+    scale: np.ndarray       # (k,)  各主成分の標準偏差 (スコアを 1 程度にそろえる)
+
+    @classmethod
+    def fit(cls, patches: np.ndarray, k: int = APPEARANCE_DIM) -> "AppearancePCA":
+        V = patch_vectors(patches)
+        mean = V.mean(axis=0)
+        _, S, Vt = np.linalg.svd(V - mean, full_matrices=False)
+        k = min(k, len(S))
+        scale = S[:k] / np.sqrt(max(len(V) - 1, 1))
+        return cls(mean.astype(np.float32), Vt[:k].astype(np.float32), np.maximum(scale, 1e-6).astype(np.float32))
+
+    def transform(self, patches: np.ndarray) -> np.ndarray:
+        return ((patch_vectors(patches) - self.mean) @ self.comp.T) / self.scale
+
+    def to_dict(self):
+        return {"mean": self.mean.round(4).tolist(), "comp": self.comp.round(5).tolist(), "scale": self.scale.tolist()}
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(np.array(d["mean"], np.float32), np.array(d["comp"], np.float32), np.array(d["scale"], np.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -90,33 +136,45 @@ def cv_predict(A: np.ndarray, Y: np.ndarray, groups: np.ndarray, alpha: float, n
 
 @dataclass
 class GazeModel:
-    """特徴ベクトル (FEATURE_NAMES) → 画面の正規化座標。"""
+    """特徴ベクトル (FEATURE_NAMES) [+ 目のパッチ] → 画面の正規化座標。"""
     alpha: float
     z0: float
     o0: float
     coef: np.ndarray        # (入力次元, 2)
     intercept: np.ndarray   # (2,)
+    appearance: AppearancePCA | None = None
 
-    def design(self, X) -> np.ndarray:
-        return geometric_features(compact_features(X), self.z0, self.o0)
+    def design(self, X, patches=None) -> np.ndarray:
+        A = geometric_features(compact_features(X), self.z0, self.o0)
+        if self.appearance is not None:
+            if patches is None:
+                raise ValueError("このモデルは目の画像 (patches) が必要です")
+            A = np.hstack([A, self.appearance.transform(np.asarray(patches).reshape(len(A), 2, *np.shape(patches)[-2:]))])
+        return A
 
-    def predict(self, X) -> np.ndarray:
-        return self.design(X) @ self.coef + self.intercept
+    def predict(self, X, patches=None) -> np.ndarray:
+        return self.design(X, patches) @ self.coef + self.intercept
 
     @classmethod
-    def fit(cls, X, Y, alpha: float, z0: float, o0: float) -> "GazeModel":
-        A = geometric_features(compact_features(X), z0, o0)
-        coef, b = ridge_fit(A, Y, alpha)
-        return cls(alpha, z0, o0, coef, b)
+    def fit(cls, X, Y, alpha: float, z0: float, o0: float, patches=None, use_appearance=False) -> "GazeModel":
+        app = AppearancePCA.fit(patches) if use_appearance else None
+        m = cls(alpha, z0, o0, np.zeros((1, 2)), np.zeros(2), app)
+        coef, b = ridge_fit(m.design(X, patches), Y, alpha)
+        m.coef, m.intercept = coef, b
+        return m
 
     def to_dict(self) -> dict:
-        return {"alpha": self.alpha, "z0": self.z0, "o0": self.o0,
-                "coef": self.coef.tolist(), "intercept": self.intercept.tolist()}
+        d = {"alpha": self.alpha, "z0": self.z0, "o0": self.o0,
+             "coef": self.coef.tolist(), "intercept": self.intercept.tolist()}
+        if self.appearance is not None:
+            d["appearance"] = self.appearance.to_dict()
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "GazeModel":
+        app = AppearancePCA.from_dict(d["appearance"]) if d.get("appearance") else None
         return cls(float(d["alpha"]), float(d["z0"]), float(d["o0"]),
-                   np.array(d["coef"], dtype=np.float64), np.array(d["intercept"], dtype=np.float64))
+                   np.array(d["coef"], dtype=np.float64), np.array(d["intercept"], dtype=np.float64), app)
 
 
 # 頭を動かしたサンプルのうち、通常姿勢からこれ以上離れたものは学習に使わない
@@ -134,15 +192,23 @@ class Profile:
     cv_error_px: float = 0.0          # 点をまたいだ交差検証誤差 (全サンプル)
     same_pose_error_px: float = 0.0   # 通常姿勢のサンプルでの誤差
     motion_error_px: float = 0.0      # 頭を動かしたサンプルでの誤差 (無ければ nan)
+    pursuit_error_px: float = float("nan")   # 動く点を追ったサンプルでの誤差
+    error_x_px: float = float("nan")  # 横方向だけの誤差
+    error_y_px: float = float("nan")  # 縦方向だけの誤差
+    uses_appearance: bool = False
+    appearance_gain_px: float = 0.0   # 見た目の特徴で減った誤差 (正なら改善)
+    pursuit_lag_s: float = float("nan")
     n_passes: int = 1
     n_motion_points: int = 0
     version: int = PROFILE_VERSION
 
     META_KEYS = ("name", "screen_w", "screen_h", "created", "cv_error_px", "same_pose_error_px",
-                 "motion_error_px", "n_passes", "n_motion_points", "version")
+                 "motion_error_px", "pursuit_error_px", "error_x_px", "error_y_px", "uses_appearance",
+                 "appearance_gain_px", "pursuit_lag_s", "n_passes", "n_motion_points", "version")
 
-    def predict(self, feat: np.ndarray) -> tuple[float, float]:
-        xy = self.model.predict(np.asarray(feat).reshape(1, -1))[0]
+    def predict(self, feat: np.ndarray, patches: np.ndarray | None = None) -> tuple[float, float]:
+        p = None if patches is None else np.asarray(patches)[None]
+        xy = self.model.predict(np.asarray(feat).reshape(1, -1), p)[0]
         return float(np.clip(xy[0], -0.1, 1.1)), float(np.clip(xy[1], -0.1, 1.1))
 
     def save(self):
@@ -150,7 +216,7 @@ class Profile:
         meta = {k: getattr(self, k) for k in self.META_KEYS}
         meta = {k: (None if isinstance(v, float) and np.isnan(v) else v) for k, v in meta.items()}
         meta["model"] = self.model.to_dict()
-        (PROFILE_DIR / f"{self.name}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        (PROFILE_DIR / f"{self.name}.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
         old = PROFILE_DIR / f"{self.name}.joblib"     # 旧形式のモデルファイルは不要
         if old.exists():
             old.unlink()
@@ -177,7 +243,8 @@ def _migrate(name: str) -> "Profile | None":
     X = np.zeros((len(d["X"]), len(FEATURE_NAMES)))
     X[:, :d["X"].shape[1]] = d["X"]           # 特徴の列が少ない古いデータは 0 で埋める (回帰が使う列は先頭にある)
     W, H = (int(v) for v in d["screen"])
-    prof = fit_profile(name, X, d["Y"], d["G"], W, H, d["P"], d["K"])
+    PA = d["PA"] if "PA" in d.files and len(d["PA"]) == len(X) else None
+    prof = fit_profile(name, X, d["Y"], d["G"], W, H, d["P"], d["K"], patches=PA)
     prof.save()
     return prof
 
@@ -207,45 +274,93 @@ def _px_err(pred, Y, mask, screen_w, screen_h) -> float:
     return float(np.linalg.norm((pred[mask] - Y[mask]) * [screen_w, screen_h], axis=1).mean())
 
 
+def _axis_err(pred, Y, mask, scale) -> float:
+    if pred is None or not np.any(mask):
+        return float("nan")
+    return float(np.abs(pred[mask] - Y[mask]).mean() * scale)
+
+
+# ---------------------------------------------------------------------------
+# 動く点のデータの遅れ補正
+# ---------------------------------------------------------------------------
+def align_pursuit(pred_xy: np.ndarray, t: np.ndarray, track_t: np.ndarray, track_xy: np.ndarray,
+                  max_lag: float = 0.5, step: float = 0.01, outlier: float = 2.5):
+    """目は動く点から少し遅れて追う (+ 表示と処理の遅れ)。
+    静止点だけで作ったモデルの予測 pred_xy と、点の軌跡 (track_t, track_xy) を比べて、
+    誤差が最も小さくなる遅れを探す。その遅れ分だけ前の点の位置を正解とし、
+    追いつくための素早い目の動き (サッカード) やまばたき直後など、大きく外れたサンプルは除く。
+    返り値: (正解の座標 (N, 2), 使うサンプルの mask, 遅れ秒)"""
+    best = None
+    for lag in np.arange(0.0, max_lag + 1e-9, step):
+        tgt = np.column_stack([np.interp(t - lag, track_t, track_xy[:, k]) for k in (0, 1)])
+        e = np.median(np.linalg.norm(pred_xy - tgt, axis=1))
+        if best is None or e < best[0]:
+            best = (e, lag, tgt)
+    _, lag, tgt = best
+    err = np.linalg.norm(pred_xy - tgt, axis=1)
+    keep = err <= outlier * np.median(err)
+    return tgt, keep, float(lag)
+
+
 def fit_profile(name: str, X: np.ndarray, Y: np.ndarray, groups: np.ndarray,
                 screen_w: int, screen_h: int, passes: np.ndarray | None = None,
-                kinds: np.ndarray | None = None) -> Profile:
-    """X: 特徴量, Y: 正規化座標(0..1), groups: 注視点 ID (姿勢ごとに別 ID),
-    passes: 座り直しパス ID, kinds: KIND_STATIC / KIND_MOTION。
+                kinds: np.ndarray | None = None, patches: np.ndarray | None = None,
+                pursuit_lag_s: float = float("nan")) -> Profile:
+    """X: 特徴量, Y: 正規化座標(0..1), groups: 注視点 ID (動く点は数秒ごとの区切り),
+    passes: 座り直しパス ID, kinds: KIND_STATIC / KIND_MOTION / KIND_PURSUIT, patches: 目のパッチ (任意)。
 
-    正則化は「ある注視点を除いて学習し、その点で評価」する交差検証で選ぶ。
-    頭を動かしたサンプルがあれば、それを除いたときの誤差も別に出す。"""
+    正則化の強さと、見た目の特徴を使うかどうかは「ある注視点を除いて学習し、その点で評価」する
+    交差検証で選ぶ。"""
     X, Y, groups = np.asarray(X, dtype=np.float64), np.asarray(Y, dtype=np.float64), np.asarray(groups)
     passes = np.zeros(len(X), dtype=int) if passes is None else np.asarray(passes)
     kinds = np.zeros(len(X), dtype=int) if kinds is None else np.asarray(kinds)
     static = kinds == KIND_STATIC
-    motion = kinds == KIND_MOTION
 
     # 極端な姿勢の動きサンプルを除外
-    keep = static | (motion & _moderate_mask(X, static))
+    keep = ~(kinds == KIND_MOTION) | _moderate_mask(X, static)
     n_dropped = int((~keep).sum())
     X, Y, groups, passes, kinds = X[keep], Y[keep], groups[keep], passes[keep], kinds[keep]
-    static, motion = kinds == KIND_STATIC, kinds == KIND_MOTION
+    if patches is not None:
+        patches = np.asarray(patches)[keep]
+    static, motion, pursuit = kinds == KIND_STATIC, kinds == KIND_MOTION, kinds == KIND_PURSUIT
     n_passes = len(np.unique(passes[static])) if np.any(static) else 1
     n_motion = len(np.unique(groups[motion])) if np.any(motion) else 0
     z0, o0 = _scale_params(X[static] if np.any(static) else X)
 
-    # 姿勢が 3 つ以上あり頭の動きデータが無いときは、姿勢ごとに除く CV の方が実態に近い
-    sel_groups = passes if (n_passes >= 3 and n_motion == 0) else groups
+    # 姿勢が 3 つ以上あり他のデータが無いときは、姿勢ごとに除く CV の方が実態に近い
+    sel_groups = passes if (n_passes >= 3 and not np.any(~static)) else groups
 
-    A = geometric_features(compact_features(X), z0, o0)
-    best = None
-    for alpha in (0.1, 0.3, 1.0, 3.0, 10.0, 30.0):
-        pred = cv_predict(A, Y, sel_groups, alpha)
-        err = _px_err(pred, Y, np.ones(len(X), bool), screen_w, screen_h)
-        if best is None or err < best[0] or np.isnan(best[0]):
-            best = (err, alpha, pred)
-    err, alpha, pred = best
-    model = GazeModel.fit(X, Y, alpha, z0, o0)
+    A_geo = geometric_features(compact_features(X), z0, o0)
+    candidates = [(False, A_geo)]
+    if patches is not None and len(patches) >= APPEARANCE_MIN_SAMPLES:
+        # 交差検証の中で PCA も学習し直すと遅いので、ここでは全データの PCA を使う
+        # (PCA は正解座標を見ないので、評価が甘くなる影響は小さい)
+        pca = AppearancePCA.fit(patches)
+        candidates.append((True, np.hstack([A_geo, pca.transform(patches)])))
+
+    results = {}
+    for use_app, A in candidates:
+        best = None
+        for alpha in (0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0):
+            pred = cv_predict(A, Y, sel_groups, alpha)
+            err = _px_err(pred, Y, np.ones(len(X), bool), screen_w, screen_h)
+            if best is None or err < best[0] or np.isnan(best[0]):
+                best = (err, alpha, pred)
+        results[use_app] = best
+    use_app = bool(True in results and results[True][0] < results[False][0])
+    err, alpha, pred = results[use_app]
+    gain = results[False][0] - results[True][0] if True in results else 0.0
+
+    model = GazeModel.fit(X, Y, alpha, z0, o0, patches, use_appearance=use_app)
+    allm = np.ones(len(X), bool)
     prof = Profile(name=name, screen_w=screen_w, screen_h=screen_h, model=model,
                    cv_error_px=err,
                    same_pose_error_px=_px_err(pred, Y, static, screen_w, screen_h),
                    motion_error_px=_px_err(pred, Y, motion, screen_w, screen_h),
+                   pursuit_error_px=_px_err(pred, Y, pursuit, screen_w, screen_h),
+                   error_x_px=_axis_err(pred[:, :1], Y[:, :1], allm, screen_w) if pred is not None else float("nan"),
+                   error_y_px=_axis_err(pred[:, 1:], Y[:, 1:], allm, screen_h) if pred is not None else float("nan"),
+                   uses_appearance=use_app, appearance_gain_px=float(gain), pursuit_lag_s=float(pursuit_lag_s),
                    n_passes=n_passes, n_motion_points=n_motion)
     prof.n_dropped = n_dropped
     return prof

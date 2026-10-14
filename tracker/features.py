@@ -78,6 +78,35 @@ class Sample:
     head_R: np.ndarray | None = None     # 頭部の回転行列 3x3
     raw_L: np.ndarray | None = None      # 正規化ランドマーク (478, 3)  再計算・解析用
     raw_M: np.ndarray | None = None      # 頭部姿勢行列 (4, 4)
+    patches: np.ndarray | None = None    # 目の周りの画像 (2, PATCH_H, PATCH_W) uint8  見た目の特徴用
+
+
+# 目の周りの画像 (パッチ) の大きさ。目尻と目頭を結ぶ線を水平にそろえて切り出す
+PATCH_W, PATCH_H = 40, 24
+PATCH_SPAN_X = 1.6     # 目の幅 (目尻〜目頭) に対する切り出し幅
+PATCH_SPAN_Y = 0.96    # 目の幅に対する切り出し高さ (まぶた・眉の下まで入る)
+
+
+def eye_patches(gray: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """グレースケール画像と画素座標のランドマークから、左右の目のパッチ (2, PATCH_H, PATCH_W) を作る。
+    目の傾きと大きさをそろえるので、頭の回転や距離の影響が小さくなる。"""
+    out = np.zeros((2, PATCH_H, PATCH_W), np.uint8)
+    for k, eye in enumerate((LEFT_EYE, RIGHT_EYE)):
+        p1, p2 = pts[eye["a"]], pts[eye["b"]]
+        if p1[0] > p2[0]:
+            p1, p2 = p2, p1
+        c = (p1 + p2) / 2
+        d = p2 - p1
+        width = float(np.hypot(*d)) + 1e-6
+        ux = d / width                       # 目の横方向 (単位)
+        uy = np.array([-ux[1], ux[0]])       # 下方向
+        sx, sy = PATCH_SPAN_X * width, PATCH_SPAN_Y * width
+        # パッチの左上・右上・左下 に対応する元画像の点
+        src = np.float32([c - ux * sx / 2 - uy * sy / 2, c + ux * sx / 2 - uy * sy / 2, c - ux * sx / 2 + uy * sy / 2])
+        dst = np.float32([[0, 0], [PATCH_W, 0], [0, PATCH_H]])
+        A = cv2.getAffineTransform(src, dst)
+        out[k] = cv2.warpAffine(gray, A, (PATCH_W, PATCH_H), flags=cv2.INTER_AREA, borderMode=cv2.BORDER_REPLICATE)
+    return out
 
 
 # 描画用の輪郭 (MediaPipe Face Mesh の番号)
@@ -252,7 +281,8 @@ class FeatureExtractor:
         pts = L[:, :2] * [w, h]
         blink = self._is_blink(min(feat[IDX["l_open"]], feat[IDX["r_open"]]))
         eye_pts = pts[[LEFT_EYE["a"], LEFT_EYE["b"], RIGHT_EYE["a"], RIGHT_EYE["b"], 468, 473]]
-        return Sample(feat, blink, True, eye_pts, pts, M[:3, :3], L.astype(np.float32), M.astype(np.float32))
+        patches = eye_patches(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY), pts)
+        return Sample(feat, blink, True, eye_pts, pts, M[:3, :3], L.astype(np.float32), M.astype(np.float32), patches)
 
     def _is_blink(self, openness: float) -> bool:
         # 直近の開き具合の中央値に対して大きく閉じていればまばたきとみなす

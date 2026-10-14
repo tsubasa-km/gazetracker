@@ -8,3 +8,4 @@ profiles/
 settings.json
 *.spec
 models/*.task
+recordings/
