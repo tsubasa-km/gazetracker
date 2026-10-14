@@ -276,6 +276,7 @@ def phase_collect(cam, fx, W, H, passes, settle=STATIC_SETTLE, collect=STATIC_CO
                     break
                 if wait_key(1) == 27:
                     return None
+            got = drop_near_blinks(fx, got)
             if len(got) < 4:
                 print(f"  pass {p + 1} point {i + 1}: サンプル不足 ({len(got)}) スキップ")
                 continue
@@ -353,6 +354,9 @@ def phase_pursuit(cam, fx, W, H, duration=40.0, lead_in=1.5):
                 times.append(ts)
         if wait_key(1) == 27:
             return None
+    keep = set(id(x) for x in drop_near_blinks(fx, samples))
+    times = [t for x, t in zip(samples, times) if id(x) in keep]
+    samples = [x for x in samples if id(x) in keep]
     return samples, np.array(times), np.array(track_t), np.array(track_xy)
 
 
@@ -485,6 +489,7 @@ def phase_motion(cam, fx, W, H, points, duration=12.0, gid0=0, max_per_point=80,
                 return None
             if el >= duration:
                 break
+        got = drop_near_blinks(fx, got)
         if len(got) < 20:
             print(f"  motion point {i + 1}: サンプル不足 ({len(got)}) スキップ")
             continue
@@ -583,6 +588,14 @@ def main():
         d = REC.close()
         if d is not None:
             print(f"録画を保存しました: {d}")
+
+
+def drop_near_blinks(fx, samples):
+    """まばたきの閉じ始め (検出より少し前) のサンプルを後から除く。"""
+    bd = getattr(fx, "blink", None)
+    if bd is None or not hasattr(bd, "near_blink"):
+        return samples
+    return [x for x in samples if not bd.near_blink(x.t)]
 
 
 def stack(samples):

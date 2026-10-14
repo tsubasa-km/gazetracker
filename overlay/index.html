@@ -5,38 +5,67 @@
 <title>Gaze Overlay</title>
 <style>
   html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: transparent; overflow: hidden; }
-  canvas { display: block; width: 100vw; height: 100vh; }
+  canvas { display: block; position: fixed; inset: 0; width: 100vw; height: 100vh; }
   #status { position: fixed; left: 8px; bottom: 8px; font: 12px monospace; color: #fff;
             background: rgba(0,0,0,.5); padding: 2px 6px; border-radius: 4px; display: none; }
 </style>
 </head>
 <body>
+<!-- ぐにゃっとした見た目 (gooey): 円をぼかしてから透明度を強く切ると、近い円同士が液体のようにくっつく -->
+<svg width="0" height="0" style="position:absolute">
+  <filter id="goo" color-interpolation-filters="sRGB">
+    <feGaussianBlur id="gooBlur" in="SourceGraphic" stdDeviation="14" result="b"/>
+    <feColorMatrix in="b" mode="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 24 -10"/>
+  </filter>
+</svg>
+<canvas id="blob"></canvas>
 <canvas id="c"></canvas>
 <div id="status"></div>
 <script>
-// URL パラメータ: ?ws=8765&color=00e5ff&size=36&trail=600&debug=1
+// URL パラメータ:
+//   style=blob (既定: ぐにゃっと動く大きめの塊) / ring (細いリングと軌跡)
+//   color=00e5ff  size=半径 px (1080p 基準。blob 既定 70, ring 既定 36)  opacity=0.5 (blob の不透明度)
+//   wobble=1.0 (blob の揺れの強さ 0〜2)  stretch=8 (blob が半径の何倍まで伸びてもちぎれないか)  trail=600 (ring の軌跡ミリ秒)  dot=1 (blob の中心点)  debug=1
 const q = new URLSearchParams(location.search);
 const WS_PORT = q.get("ws") || "8765";
+const STYLE   = q.get("style") || "blob";
 const COLOR   = "#" + (q.get("color") || "00e5ff");
-const SIZE    = parseFloat(q.get("size") || "36");     // リング半径 (px, 1080p 基準)
-const TRAIL_MS = parseInt(q.get("trail") || "600");    // 軌跡を残す時間
+const SIZE    = parseFloat(q.get("size") || (STYLE === "ring" ? "36" : "70"));
+const OPACITY = parseFloat(q.get("opacity") || "0.5");
+const WOBBLE  = Math.max(0, Math.min(2, parseFloat(q.get("wobble") || "1")));
+const TRAIL_MS = parseInt(q.get("trail") || "600");
+const SHOW_DOT = q.get("dot") !== "0";
 const DEBUG   = q.get("debug") === "1";
+const STRETCH = parseFloat(q.get("stretch") || "8");   // blob: 半径の何倍まで伸びてもつながっているか
 
+const blobCv = document.getElementById("blob");
+const bctx = blobCv.getContext("2d");
 const cv = document.getElementById("c");
 const ctx = cv.getContext("2d");
 const status = document.getElementById("status");
 if (DEBUG) status.style.display = "block";
+if (STYLE === "blob") {
+  blobCv.style.filter = "url(#goo)";
+  blobCv.style.opacity = OPACITY;
+}
 
 function resize() {
-  cv.width = window.innerWidth * devicePixelRatio;
-  cv.height = window.innerHeight * devicePixelRatio;
+  for (const c of [cv, blobCv]) {
+    c.width = window.innerWidth * devicePixelRatio;
+    c.height = window.innerHeight * devicePixelRatio;
+  }
+  // ぼかしの強さは見た目の大きさに合わせる (CSS px)
+  const r = SIZE * (window.innerHeight / 1080);
+  document.getElementById("gooBlur").setAttribute("stdDeviation", String(Math.max(4, r * 0.28)));
 }
 window.addEventListener("resize", resize);
 resize();
 
-let hist = [];          // {x, y, t}
+let hist = [];          // ring 用の軌跡 {x, y, t}
 let last = null;        // 最新メッセージ
+let target = null;      // 最新の視線 (正規化座標)
 let connected = false;
+let lastSeen = 0;       // 視線が取れた (またはまばたき中だった) 最後の時刻
 
 function connect() {
   const ws = new WebSocket(`ws://localhost:${WS_PORT}/`);
@@ -46,26 +75,123 @@ function connect() {
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     last = m;
+    const now = performance.now();
     if (m.valid) {
-      const now = performance.now();
+      target = { x: m.x, y: m.y };
+      lastSeen = now;
       hist.push({ x: m.x, y: m.y, t: now });
       while (hist.length && now - hist[0].t > TRAIL_MS) hist.shift();
+    } else if (m.blink) {
+      lastSeen = now;      // まばたき中は直前の位置に留める (消さない、動かさない)
     }
   };
 }
 connect();
 
-let lastSeen = 0;
+// ---- blob: ばねでつながった数個の円。先頭が視線を追い、後ろの円が遅れてついてくる ----
+// 動くと後ろの円が引き伸ばされて尾を引き、止まると追いついて 1 つの塊に戻りながら少し揺れる
+const N = 5;
+const RADII = [1.0, 0.82, 0.68, 0.56, 0.46];
+const nodes = Array.from({ length: N }, () => ({ x: 0, y: 0, vx: 0, vy: 0 }));
+let initialized = false;
+
+function stepPhysics(dt, tx, ty) {
+  // 先頭: 視線へ。やや振動するばね (止まったときに少しぷるんとする)
+  const k0 = 160, c0 = 26 - 10 * WOBBLE;
+  // 後続: 前の円へ。柔らかめで、遅れてついてくる
+  const k1 = 520, c1 = 34 - 12 * WOBBLE;
+  for (let i = 0; i < N; i++) {
+    const n = nodes[i];
+    const gx = i === 0 ? tx : nodes[i - 1].x;
+    const gy = i === 0 ? ty : nodes[i - 1].y;
+    const k = i === 0 ? k0 : k1, c = i === 0 ? c0 : c1;
+    n.vx += (k * (gx - n.x) - c * n.vx) * dt;
+    n.vy += (k * (gy - n.y) - c * n.vy) * dt;
+    n.x += n.vx * dt;
+    n.y += n.vy * dt;
+  }
+}
+
+function drawBlob(alpha) {
+  const W = blobCv.width, H = blobCv.height;
+  bctx.clearRect(0, 0, W, H);
+  if (alpha <= 0) return;
+  const R = SIZE * (H / 1080);
+  const head = nodes[0];
+  const speed = Math.hypot(head.vx, head.vy) / H;         // 画面の高さ/秒
+  const squash = Math.min(0.25, speed * 0.08);             // 速いほど少し細く
+  bctx.globalAlpha = alpha;
+  bctx.fillStyle = COLOR;
+  const rad = (i) => R * RADII[i] * (1 - squash * (i === 0 ? 1 : 0.5));
+  // 隣り合う円の間を細い円でつなぎ、伸びた液体のように見せる。STRETCH 倍より離れたらちぎれる
+  for (let i = N - 1; i > 0; i--) {
+    const a = nodes[i], b = nodes[i - 1];
+    const d = Math.hypot(b.x - a.x, b.y - a.y);
+    const ra = rad(i), rb = rad(i - 1);
+    if (d < 1 || d > STRETCH * R) continue;
+    const thin = 0.55 * (1 - 0.6 * d / (STRETCH * R));      // 伸びるほど細くなる
+    const steps = Math.ceil(d / (0.35 * R));
+    for (let k = 1; k < steps; k++) {
+      const u = k / steps;
+      const r = (ra + (rb - ra) * u) * thin;
+      bctx.beginPath();
+      bctx.arc(a.x + (b.x - a.x) * u, a.y + (b.y - a.y) * u, Math.max(1, r), 0, Math.PI * 2);
+      bctx.fill();
+    }
+  }
+  for (let i = N - 1; i >= 0; i--) {
+    const n = nodes[i];
+    bctx.beginPath();
+    bctx.arc(n.x, n.y, Math.max(1, rad(i)), 0, Math.PI * 2);
+    bctx.fill();
+  }
+  bctx.globalAlpha = 1;
+}
+
+let prevT = performance.now();
 function draw() {
   requestAnimationFrame(draw);
-  const W = cv.width, H = cv.height;
-  const scale = H / 1080;
-  ctx.clearRect(0, 0, W, H);
-
   const now = performance.now();
-  while (hist.length && now - hist[0].t > TRAIL_MS) hist.shift();
+  const dt = Math.min(0.05, (now - prevT) / 1000);
+  prevT = now;
+  const W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  const fade = Math.max(0, 1 - Math.max(0, now - lastSeen - 300) / 400);   // 顔が取れなくなったら消える
 
-  // 軌跡
+  if (STYLE === "blob") {
+    if (target) {
+      const tx = target.x * W, ty = target.y * H;
+      if (!initialized) {
+        for (const n of nodes) { n.x = tx; n.y = ty; }
+        initialized = true;
+      }
+      // 小さな刻みで計算すると、フレームレートが変わっても動きが安定する
+      const sub = Math.ceil(dt / 0.004);
+      for (let s = 0; s < sub; s++) stepPhysics(dt / sub, tx, ty);
+    }
+    drawBlob(initialized ? fade : 0);
+    if (SHOW_DOT && initialized && fade > 0) {
+      const h = nodes[0];
+      ctx.globalAlpha = fade * 0.9;
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath(); ctx.arc(h.x, h.y, 3.5 * (H / 1080), 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+  } else {
+    drawRing(now, W, H, fade);
+  }
+
+  if (DEBUG) {
+    status.textContent = `${connected ? "connected" : "disconnected"}  style=${STYLE}  ` +
+      (last ? `fps=${last.fps} face=${last.face} blink=${last.blink} ` +
+              (last.valid ? `x=${last.x.toFixed(3)} y=${last.y.toFixed(3)}` : "") : "");
+  }
+}
+
+// ---- ring: 以前の見た目 (細いリング + 軌跡) ----
+function drawRing(now, W, H, fade) {
+  const scale = H / 1080;
+  while (hist.length && now - hist[0].t > TRAIL_MS) hist.shift();
   if (hist.length > 1) {
     ctx.lineCap = "round"; ctx.lineJoin = "round";
     for (let i = 1; i < hist.length; i++) {
@@ -81,15 +207,8 @@ function draw() {
     }
     ctx.globalAlpha = 1;
   }
-
-  // 現在位置のリング
-  if (last && last.valid) {
-    lastSeen = now;
-  }
-  const fade = Math.max(0, 1 - (now - lastSeen) / 400);   // 顔ロスト・まばたき時にフェード
-  if (hist.length && fade > 0) {
-    const p = hist[hist.length - 1];
-    const x = p.x * W, y = p.y * H, r = SIZE * scale;
+  if (target && fade > 0) {
+    const x = target.x * W, y = target.y * H, r = SIZE * scale;
     ctx.globalAlpha = fade;
     ctx.strokeStyle = COLOR;
     ctx.lineWidth = 4 * scale;
@@ -100,13 +219,8 @@ function draw() {
     ctx.beginPath(); ctx.arc(x, y, 4 * scale, 0, Math.PI * 2); ctx.fill();
     ctx.globalAlpha = 1;
   }
-
-  if (DEBUG) {
-    status.textContent = `${connected ? "connected" : "disconnected"}  ` +
-      (last ? `fps=${last.fps} face=${last.face} blink=${last.blink} ` +
-              (last.valid ? `x=${last.x.toFixed(3)} y=${last.y.toFixed(3)}` : "") : "");
-  }
 }
+
 draw();
 </script>
 </body>

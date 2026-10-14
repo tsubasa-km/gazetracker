@@ -79,6 +79,61 @@ class Sample:
     raw_L: np.ndarray | None = None      # 正規化ランドマーク (478, 3)  再計算・解析用
     raw_M: np.ndarray | None = None      # 頭部姿勢行列 (4, 4)
     patches: np.ndarray | None = None    # 目の周りの画像 (2, PATCH_H, PATCH_W) uint8  見た目の特徴用
+    t: float = 0.0                       # 撮影時刻 (秒)
+    openness_ratio: float = 1.0          # 目の開き / 普段の開き
+
+
+class BlinkDetector:
+    """まばたきの判定。閉じかけ・開きかけの途中も含めて除く。
+
+    途中のフレームでは目の開きが小さく、虹彩もまぶたに隠れるので、推定が「下を見た」側に大きくぶれる。
+    - 開き具合が普段 (直近の開いているときの中央値) の ENTER 倍未満、または
+      1 フレームで普段の DROP 倍以上急に閉じて DROP_BELOW 倍未満になったら、まばたき開始
+    - EXIT 倍以上に戻った状態が EXIT_FRAMES 続いたら終了。その後さらに HOLD 秒は除く
+    下を見たときの自然な開きの減少 (普段の 0.85〜0.9 倍程度) では反応しないよう、
+    どの閾値もそれより下に置いている。"""
+    ENTER, DROP, DROP_BELOW, EXIT, EXIT_FRAMES, HOLD = 0.72, 0.2, 0.8, 0.8, 2, 0.12
+
+    def __init__(self):
+        self.hist: deque = deque(maxlen=90)
+        self.in_blink = False
+        self.exit_count = 0
+        self.hold_until = -1.0
+        self.prev_ratio = 1.0
+        self.events: deque = deque(maxlen=200)   # (開始時刻, 終了時刻)
+        self._start = None
+
+    def baseline(self) -> float | None:
+        return float(np.median(self.hist)) if len(self.hist) >= 15 else None
+
+    def __call__(self, openness: float, t: float) -> tuple[bool, float]:
+        base = self.baseline()
+        if base is None:
+            blink = openness < 0.05
+            if not blink:
+                self.hist.append(openness)
+            return blink, 1.0
+        r = openness / max(base, 1e-6)
+        if not self.in_blink:
+            if r < self.ENTER or ((self.prev_ratio - r) > self.DROP and r < self.DROP_BELOW):
+                self.in_blink, self.exit_count, self._start = True, 0, t
+        else:
+            self.exit_count = self.exit_count + 1 if r >= self.EXIT else 0
+            if self.exit_count >= self.EXIT_FRAMES:
+                self.in_blink = False
+                self.hold_until = t + self.HOLD
+                self.events.append((self._start, t + self.HOLD))
+        self.prev_ratio = r
+        blink = self.in_blink or t < self.hold_until
+        if not blink:
+            self.hist.append(openness)
+        return blink, r
+
+    def near_blink(self, t: float, before: float = 0.1) -> bool:
+        """t がまばたきの直前 before 秒〜終了 (保留を含む) に入るか。閉じ始めの検出漏れを後から除くのに使う。"""
+        if self.in_blink and self._start is not None and t >= self._start - before:
+            return True
+        return any(a - before <= t <= b for a, b in self.events)
 
 
 # 目の周りの画像 (パッチ) の大きさ。目尻と目頭を結ぶ線を水平にそろえて切り出す
@@ -260,7 +315,7 @@ class FeatureExtractor:
         )
         self._lm = vision.FaceLandmarker.create_from_options(opts)
         self._last_ts = -1
-        self._open_hist: deque = deque(maxlen=90)   # まばたき閾値の適応用
+        self.blink = BlinkDetector()
 
     def process(self, frame_bgr: np.ndarray, ts_ms: int) -> Sample:
         # MediaPipe は単調増加のタイムスタンプを要求する
@@ -279,21 +334,12 @@ class FeatureExtractor:
         M = np.array(res.facial_transformation_matrixes[0], dtype=np.float64)
         feat = features_from_raw(L, M, w, h)
         pts = L[:, :2] * [w, h]
-        blink = self._is_blink(min(feat[IDX["l_open"]], feat[IDX["r_open"]]))
+        t = ts_ms / 1000.0
+        blink, ratio = self.blink(min(feat[IDX["l_open"]], feat[IDX["r_open"]]), t)
         eye_pts = pts[[LEFT_EYE["a"], LEFT_EYE["b"], RIGHT_EYE["a"], RIGHT_EYE["b"], 468, 473]]
         patches = eye_patches(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY), pts)
-        return Sample(feat, blink, True, eye_pts, pts, M[:3, :3], L.astype(np.float32), M.astype(np.float32), patches)
-
-    def _is_blink(self, openness: float) -> bool:
-        # 直近の開き具合の中央値に対して大きく閉じていればまばたきとみなす
-        if len(self._open_hist) >= 15:
-            med = float(np.median(self._open_hist))
-            blink = openness < 0.55 * med
-        else:
-            blink = openness < 0.05
-        if not blink:
-            self._open_hist.append(openness)
-        return blink
+        return Sample(feat, blink, True, eye_pts, pts, M[:3, :3], L.astype(np.float32), M.astype(np.float32), patches,
+                      t, ratio)
 
     def close(self):
         self._lm.close()

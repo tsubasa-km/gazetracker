@@ -249,14 +249,22 @@ class App(ctk.CTk):
         ctk.CTkLabel(top, text="マーカー").grid(row=1, column=0, padx=10, pady=(0, 8))
         opt = ctk.CTkFrame(top, fg_color="transparent")
         opt.grid(row=1, column=1, columnspan=3, sticky="w", padx=4, pady=(0, 8))
+        first_style = "style" not in self.settings        # 以前のリング用の半径 (36) を引き継がない
+        self.style_var = ctk.StringVar(value={"ring": "リング"}.get(self.settings.get("style"), "ぐにゃ"))
         self.color_var = ctk.StringVar(value=self.settings.get("color", "00e5ff"))
-        self.size_var = ctk.StringVar(value=self.settings.get("size", "36"))
+        self.size_var = ctk.StringVar(value="" if first_style else self.settings.get("size", ""))
+        self.opacity_var = ctk.StringVar(value=self.settings.get("opacity", "0.5"))
         self.trail_var = ctk.StringVar(value=self.settings.get("trail", "600"))
-        for label, var, w in (("色 #", self.color_var, 80), ("半径px", self.size_var, 50), ("軌跡ms", self.trail_var, 60)):
+        ctk.CTkSegmentedButton(opt, values=["ぐにゃ", "リング"], variable=self.style_var,
+                               command=lambda _v: self._update_url()).pack(side="left", padx=(6, 4))
+        for label, var, w in (("色 #", self.color_var, 70), ("半径px", self.size_var, 44), ("不透明度", self.opacity_var, 44),
+                              ("軌跡ms", self.trail_var, 50)):
             ctk.CTkLabel(opt, text=label).pack(side="left", padx=(6, 2))
             e = ctk.CTkEntry(opt, textvariable=var, width=w)
             e.pack(side="left")
             e.bind("<KeyRelease>", lambda _e: self._update_url())
+        ctk.CTkLabel(top, text="ぐにゃ: 大きめの塊が視線を追い、動くと伸びて止まるとぷるんと戻る。半径を空にすると見た目ごとの既定 (ぐにゃ 70 / リング 36)。不透明度はぐにゃ、軌跡はリングだけに効く",
+                     font=ctk.CTkFont(size=11), text_color="gray", wraplength=640, justify="left").grid(row=2, column=1, columnspan=3, sticky="w", padx=6, pady=(0, 8))
         self._update_url()
 
         self.preview = ctk.CTkLabel(f, text="トラッキングを開始するとカメラ映像がここに出ます", fg_color="gray12", corner_radius=8)
@@ -379,11 +387,16 @@ class App(ctk.CTk):
 
     def _update_url(self):
         p = []
+        ring = self.style_var.get() == "リング"
+        if ring:
+            p.append("style=ring")
         if self.color_var.get().strip("#") != "00e5ff":
             p.append("color=" + self.color_var.get().strip("#"))
-        if self.size_var.get() != "36":
-            p.append("size=" + self.size_var.get())
-        if self.trail_var.get() != "600":
+        if self.size_var.get().strip():
+            p.append("size=" + self.size_var.get().strip())
+        if not ring and self.opacity_var.get().strip() not in ("", "0.5"):
+            p.append("opacity=" + self.opacity_var.get().strip())
+        if ring and self.trail_var.get() != "600":
             p.append("trail=" + self.trail_var.get())
         self.url_var.set("http://localhost:8766/?ws=8765" + ("&" + "&".join(p) if p else ""))
 
@@ -540,7 +553,8 @@ class App(ctk.CTk):
         d = {"profile": self.profile_var.get(), "camera": self.camera_var.get(), "monitor": self.monitor_var.get(),
              "passes": self.passes_var.get(), "motion_points": self.motion_var.get(), "pursuit_seconds": self.pursuit_var.get(), "record": self.record_var.get(), "log": self.log_var.get(), "min_cutoff": self.cutoff_var.get(),
              "beta": self.beta_var.get(), "color": self.color_var.get(), "size": self.size_var.get(),
-             "trail": self.trail_var.get(), "hotkey": self.hotkey_var.get(), "reset_hotkey": self.reset_hotkey_var.get()}
+             "trail": self.trail_var.get(), "style": "ring" if self.style_var.get() == "リング" else "blob",
+             "opacity": self.opacity_var.get(), "hotkey": self.hotkey_var.get(), "reset_hotkey": self.reset_hotkey_var.get()}
         try:
             SETTINGS.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception:
