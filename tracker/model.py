@@ -200,13 +200,14 @@ class Profile:
     uses_appearance: bool = False
     appearance_gain_px: float = 0.0   # 見た目の特徴で減った誤差 (正なら改善)
     pursuit_lag_s: float = float("nan")
+    n_sessions: int = 1               # 何回分のキャリブレーションのデータで学習したか
     n_passes: int = 1
     n_motion_points: int = 0
     version: int = PROFILE_VERSION
 
     META_KEYS = ("name", "screen_w", "screen_h", "created", "cv_error_px", "same_pose_error_px",
                  "motion_error_px", "pursuit_error_px", "error_x_px", "error_y_px", "uses_appearance",
-                 "appearance_gain_px", "pursuit_lag_s", "n_passes", "n_motion_points", "version")
+                 "appearance_gain_px", "pursuit_lag_s", "n_sessions", "n_passes", "n_motion_points", "version")
 
     def predict(self, feat: np.ndarray, patches: np.ndarray | None = None) -> tuple[float, float]:
         p = None if patches is None else np.asarray(patches)[None]

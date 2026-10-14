@@ -172,6 +172,10 @@ class App(ctk.CTk):
         ctk.CTkSegmentedButton(f, values=["0", "20", "40", "60"], variable=self.pursuit_var).grid(row=r, column=1, sticky="w", padx=12, pady=4); r += 1
         ctk.CTkLabel(f, text="ゆっくり動く点を目で追い、上下の位置を連続して集める (縦方向の精度向上)。0 で省略", font=ctk.CTkFont(size=11), text_color="gray", wraplength=330, justify="left").grid(row=r, column=0, columnspan=2, sticky="w", padx=12); r += 1
 
+        self.accum_var = ctk.BooleanVar(value=self.settings.get("accumulate", True))
+        ctk.CTkCheckBox(f, text="前回までのキャリブレーションのデータも使う", variable=self.accum_var).grid(row=r, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0)); r += 1
+        ctk.CTkLabel(f, text="同じプロファイルで直近 3 回分のデータを合わせて学習し、回を重ねるほど精度を上げる。カメラや座る場所を変えたときは外すか、プロファイルを分ける", font=ctk.CTkFont(size=11), text_color="gray", wraplength=330, justify="left").grid(row=r, column=0, columnspan=2, sticky="w", padx=12); r += 1
+
         self.record_var = ctk.BooleanVar(value=self.settings.get("record", False))
         ctk.CTkCheckBox(f, text="キャリブレーションを検証用に録画する (recordings/)", variable=self.record_var).grid(row=r, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0)); r += 1
         ctk.CTkLabel(f, text="カメラ映像と点の位置を保存し、あとで手法の比較に使う。1 分あたり約 100MB", font=ctk.CTkFont(size=11), text_color="gray", wraplength=330, justify="left").grid(row=r, column=0, columnspan=2, sticky="w", padx=12); r += 1
@@ -426,6 +430,7 @@ class App(ctk.CTk):
                          "--camera", str(self._camera_index()), "--passes", self.passes_var.get(), "--motion-points", self.motion_var.get(), "--pursuit-seconds", self.pursuit_var.get(), "--cam-res", "auto")
         if self.record_var.get():
             cmd.append("--record")
+        cmd += ["--accumulate", "3" if self.accum_var.get() else "1"]
         env = dict(os.environ, PYTHONIOENCODING="utf-8")
         self.calib_proc = subprocess.Popen(cmd, cwd=str(APP_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                            text=True, encoding="utf-8", errors="replace", env=env,
@@ -459,6 +464,8 @@ class App(ctk.CTk):
                 if info.get("motion_error_px"):
                     parts.append(f"頭を動かしたとき 約 {info['motion_error_px']:.0f}px")
                 app = "使用" if info.get("uses_appearance") else "不使用"
+                if (info.get("n_sessions") or 1) > 1:
+                    app += f"、{info['n_sessions']} 回分のデータで学習"
                 rec = [l for l in out if l.startswith("録画を保存しました")]
                 self._msg(f"プロファイル '{prof}' を保存しました。推定誤差: " + " / ".join(parts)
                           + f" (幅の {pct:.1f}%): {grade}。目の画像の特徴: {app}" + ("\n" + rec[-1] if rec else ""))
@@ -551,7 +558,7 @@ class App(ctk.CTk):
 
     def _save_settings(self):
         d = {"profile": self.profile_var.get(), "camera": self.camera_var.get(), "monitor": self.monitor_var.get(),
-             "passes": self.passes_var.get(), "motion_points": self.motion_var.get(), "pursuit_seconds": self.pursuit_var.get(), "record": self.record_var.get(), "log": self.log_var.get(), "min_cutoff": self.cutoff_var.get(),
+             "passes": self.passes_var.get(), "motion_points": self.motion_var.get(), "pursuit_seconds": self.pursuit_var.get(), "record": self.record_var.get(), "accumulate": self.accum_var.get(), "log": self.log_var.get(), "min_cutoff": self.cutoff_var.get(),
              "beta": self.beta_var.get(), "color": self.color_var.get(), "size": self.size_var.get(),
              "trail": self.trail_var.get(), "style": "ring" if self.style_var.get() == "リング" else "blob",
              "opacity": self.opacity_var.get(), "hotkey": self.hotkey_var.get(), "reset_hotkey": self.reset_hotkey_var.get()}

@@ -293,9 +293,10 @@ def phase_collect(cam, fx, W, H, passes, settle=STATIC_SETTLE, collect=STATIC_CO
 
 def pursuit_path(t: float):
     """動く点の軌跡 (正規化座標)。周期の違う 2 つの正弦波 (リサージュ曲線) で画面全体をなめらかになぞる。
-    速さは最大で画面幅の 0.2 倍/秒程度 (目で無理なく追える速さ)。"""
-    return (0.5 + 0.42 * np.sin(2 * np.pi * t / 13.0),
-            0.5 + 0.40 * np.sin(2 * np.pi * t / 9.0))
+    周期は「画面を 5x5 に区切った全マスを約 40 秒で通る」組み合わせを探して決めた (13 秒 / 9 秒だと 80 秒かかった)。
+    速さは最大で横が画面幅の 0.28 倍/秒、縦が画面高さの 0.19 倍/秒 (目で無理なく追える速さ)。"""
+    return (0.5 + 0.42 * np.sin(2 * np.pi * t / 9.5),
+            0.5 + 0.40 * np.sin(2 * np.pi * t / 13.5 + np.pi / 2))
 
 
 def show_pursuit_guide(cam, fx, W, H, duration):
@@ -305,7 +306,7 @@ def show_pursuit_guide(cam, fx, W, H, duration):
         canvas = np.full((H, W, 3), BG, np.uint8)
         draw_texts(canvas, [
             ("次は、動く点を目で追います", 120, 56, ORANGE),
-            (f"{duration:.0f} 秒間、点がゆっくり画面全体を動きます", 215, 32, WHITE),
+            (f"{duration:.0f} 秒ほど、点がゆっくり画面全体を動きます (瞬きで取りこぼした場所があれば少し延長)", 215, 30, WHITE),
             ("頭は動かさず、目だけで点を追い続けてください", 265, 30, WHITE),
             ("上下の位置をたくさん集めて、縦方向のずれを減らします", 315, 26, GRAY),
             ("顔を検出しています" if s.ok else "顔が検出できません", H // 2 + 60, 28, GREEN if s.ok else RED),
@@ -319,26 +320,48 @@ def show_pursuit_guide(cam, fx, W, H, duration):
             return True
 
 
+PURSUIT_CELLS = 5            # 網羅の判定: 画面を 5x5 に区切る
+PURSUIT_PER_CELL = 10        # 各マスに必要な (瞬き以外の) サンプル数
+PURSUIT_MAX_FACTOR = 2.25    # 最低秒数の何倍まで延長するか (既定 40 秒 → 最大 90 秒)
+PURSUIT_ASSUMED_LAG = 0.23   # 網羅の判定に使う目の遅れの目安 (秒)。学習では改めて推定する
+
+
+def pursuit_cell(x, y):
+    """正規化座標 → 5x5 のマス番号 (点が動く範囲 0.08〜0.92 を等分)"""
+    cx = int(np.clip((x - 0.08) / 0.84 * PURSUIT_CELLS, 0, PURSUIT_CELLS - 1))
+    cy = int(np.clip((y - 0.10) / 0.80 * PURSUIT_CELLS, 0, PURSUIT_CELLS - 1))
+    return cy * PURSUIT_CELLS + cx
+
+
 def phase_pursuit(cam, fx, W, H, duration=40.0, lead_in=1.5):
     """動く点を目で追ってもらう。点は最初 lead_in 秒止まってから動き出す。
+    duration 秒たっても、画面を 5x5 に区切った全マスで瞬き以外のサンプルが PURSUIT_PER_CELL 個そろうまでは続ける
+    (瞬きで取りこぼした場所を自動で取り直す)。最長は duration の PURSUIT_MAX_FACTOR 倍。
     返り値: (サンプル, 撮影時刻, 軌跡の時刻, 軌跡の座標) か None (中止)。"""
     samples, times, track_t, track_xy = [], [], [], []
+    counts = np.zeros(PURSUIT_CELLS * PURSUIT_CELLS, int)
     t_start = time.time() + lead_in
+    t_max = duration * PURSUIT_MAX_FACTOR
     last = None
     while True:
         now = time.time()
         el = now - t_start
-        if el >= duration:
+        covered = float(np.mean(np.minimum(counts, PURSUIT_PER_CELL)) / PURSUIT_PER_CELL)
+        if el >= t_max or (el >= duration and covered >= 1.0):
             break
         canvas = np.full((H, W, 3), BG, np.uint8)
         nx, ny = pursuit_path(max(el, 0.0))
         cx, cy = int(nx * W), int(ny * H)
         cv2.circle(canvas, (cx, cy), 16, (0, 200, 255), 2, cv2.LINE_AA)
         cv2.circle(canvas, (cx, cy), 5, (0, 0, 255), -1, cv2.LINE_AA)
-        bar = int(W * min(max(el, 0) / duration, 1))
-        cv2.rectangle(canvas, (0, H - 6), (bar, H), (0, 200, 255), -1)
+        # 進み具合: 時間 (最低秒数まで) と網羅率の低い方
+        cv2.rectangle(canvas, (0, H - 6), (int(W * min(max(el, 0) / duration, 1) * (covered if el >= duration else 1)), H),
+                      (0, 200, 255), -1)
         if el < 0:
             draw_texts(canvas, [("この点を目で追ってください", max(cy - 90, 20), 32, ORANGE)])
+        elif el >= duration:
+            cv2.putText(canvas, f"collecting missed areas {int(covered * 100)}%", (20, H - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (120, 120, 120), 1, cv2.LINE_AA)
         cv2.imshow(WIN, canvas)
         # 表示した時刻と位置を軌跡として残す (撮影時刻との対応は後で遅れ込みで合わせる)
         track_t.append(now)
@@ -352,11 +375,14 @@ def phase_pursuit(cam, fx, W, H, duration=40.0, lead_in=1.5):
             if ts >= t_start + 0.5 and s.ok and not s.blink:      # 動き出してすぐは目が追いついていない
                 samples.append(s)
                 times.append(ts)
+                lx, ly = pursuit_path(max(ts - t_start - PURSUIT_ASSUMED_LAG, 0.0))
+                counts[pursuit_cell(lx, ly)] += 1
         if wait_key(1) == 27:
             return None
     keep = set(id(x) for x in drop_near_blinks(fx, samples))
     times = [t for x, t in zip(samples, times) if id(x) in keep]
     samples = [x for x in samples if id(x) in keep]
+    print(f"動く点: {max(time.time() - t_start, 0):.0f} 秒、網羅率 {int(covered * 100)}%")
     return samples, np.array(times), np.array(track_t), np.array(track_xy)
 
 
@@ -527,7 +553,9 @@ def phase_verify(cam, fx, W, H, prof):
             sub += f"  頭を動かしたとき 約 {prof.motion_error_px:.0f} px"
         lines.append((sub, 90, 26, GRAY))
         lines.append((("目の画像の特徴: 使用" if prof.uses_appearance else "目の画像の特徴: 不使用")
-                      + f" (効果 {prof.appearance_gain_px:+.0f} px)", 130, 22, GRAY))
+                      + f" (効果 {prof.appearance_gain_px:+.0f} px)"
+                      + (f"   キャリブレーション {prof.n_sessions} 回分のデータで学習" if getattr(prof, "n_sessions", 1) > 1 else ""),
+                      130, 22, GRAY))
         lines.append(("画面のあちこちを見て、頭も少し動かして確かめてください", H - 130, 28, GRAY))
         lines.append(("SPACE: 保存    R: やり直し    ESC: 破棄", H - 80, 30, WHITE))
         draw_texts(canvas, lines)
@@ -551,6 +579,8 @@ def main():
     ap.add_argument("--motion-seconds", type=float, default=12.0, help="1 点あたり頭を動かす秒数")
     ap.add_argument("--pursuit-seconds", type=float, default=40.0, help="動く点を目で追う秒数 (0 で省略)")
     ap.add_argument("--record", action="store_true", help="検証用にカメラ映像と点の位置を recordings/ に録画する")
+    ap.add_argument("--accumulate", type=int, default=3,
+                    help="同じプロファイルの前回までのデータと合わせて学習する回数 (1 で今回だけ。既定 3 = 前々回まで)")
     ap.add_argument("--cam-res", default="auto", help="カメラ解像度 (auto=出せる最大, 1920x1080, 1280x720, 640x480)")
     ap.add_argument("--list-monitors", action="store_true")
     a = ap.parse_args()
@@ -573,7 +603,7 @@ def main():
     global REC
     if a.record:
         REC = Recorder(W, H, cam.description, (cam.width, cam.height), fps=cam.fps,
-                       extra={"profile": a.profile, "pursuit": "0.5+0.42sin(2πt/13), 0.5+0.40sin(2πt/9)"})
+                       extra={"profile": a.profile, "pursuit": "0.5+0.42sin(2πt/9.5), 0.5+0.40sin(2πt/13.5+π/2)"})
         print(f"録画: {REC.dir}")
     open_fullscreen(mon)
     try:
@@ -650,21 +680,56 @@ def run_once(cam, fx, W, H, cw, ch, passes, a):
 
     X, RL, RM, PA = stack(S)
     Y, G, P, K, T = np.array(Y, float), np.array(G), np.array(P), np.array(K), np.array(T)
-    print(f"samples={len(X)}, points={len(np.unique(G))}, static={int((K == KIND_STATIC).sum())}, "
+    SES = np.zeros(len(X), int)            # 何回前のキャリブレーションのデータか (0 = 今回)
+    prev = load_previous(a.profile, W, H, X.shape[1], PA.shape[1:], a.accumulate - 1)
+    if prev is not None:
+        pX, pY, pG, pP, pK, pT, pPA, pS, pRL, pRM = prev
+        G0 = int(G.max()) + 1
+        X = np.vstack([X, pX]); Y = np.vstack([Y, pY]); G = np.concatenate([G, pG + G0 + 100000 * pS])
+        P = np.concatenate([P, np.where(pP >= 0, pP + 100 * pS, pP)]); K = np.concatenate([K, pK]); T = np.concatenate([T, pT])
+        PA = np.concatenate([PA, pPA]); SES = np.concatenate([SES, pS]); RL = np.concatenate([RL, pRL]); RM = np.concatenate([RM, pRM])
+        print(f"前回までのデータを追加: {len(pX)} サンプル ({len(np.unique(pS))} 回分)")
+    print(f"samples={len(X)} (今回 {int((SES == 0).sum())}), points={len(np.unique(G))}, static={int((K == KIND_STATIC).sum())}, "
           f"pursuit={int((K == KIND_PURSUIT).sum())}, motion={int((K == KIND_MOTION).sum())}")
     prof = fit_profile(a.profile, X, Y, G, W, H, P, K, patches=PA, pursuit_lag_s=lag)
     print(f"交差検証誤差: {prof.cv_error_px:.1f} px (横 {prof.error_x_px:.1f} / 縦 {prof.error_y_px:.1f}, "
           f"静止 {prof.same_pose_error_px:.1f}, 動く点 {prof.pursuit_error_px:.1f}, 頭を動かしたとき {prof.motion_error_px:.1f}, "
           f"目の画像 {'使用' if prof.uses_appearance else '不使用'} 効果 {prof.appearance_gain_px:+.1f} px, "
           f"除外 {getattr(prof, 'n_dropped', 0)} サンプル)")
+    prof.n_sessions = int(len(np.unique(SES)))
     r = phase_verify(cam, fx, W, H, prof)
     if r == "save":
         prof.save()
-        # 生データも残す (モデルの調整や再学習に使う)
+        # 生データも残す (モデルの調整や再学習、次回の追加学習に使う)。SES は何回前のデータか
         np.savez_compressed(PROFILE_DIR / f"{a.profile}_calib.npz", X=X, Y=Y, G=G, P=P, K=K, T=T, L=RL, M=RM, PA=PA,
-                            screen=np.array([W, H]), cam=np.array([cw, ch]), lag=np.array(lag),
+                            SES=SES, screen=np.array([W, H]), cam=np.array([cw, ch]), lag=np.array(lag),
                             ref=ref if ref is not None else np.zeros(0))
     return r
+
+
+def load_previous(profile, W, H, n_feat, patch_shape, max_sessions):
+    """前回までのキャリブレーションの生データを読む。画面サイズや特徴の形が違う、古い形式などなら None。
+    返すデータの SES は 1 = 前回, 2 = 前々回 ...。max_sessions 回分まで。"""
+    if max_sessions <= 0:
+        return None
+    path = PROFILE_DIR / f"{profile}_calib.npz"
+    if not path.exists():
+        return None
+    try:
+        d = np.load(path)
+        if tuple(d["screen"]) != (W, H) or d["X"].shape[1] != n_feat or "PA" not in d.files \
+                or tuple(d["PA"].shape[1:]) != tuple(patch_shape) or len(d["PA"]) != len(d["X"]):
+            print("前回のデータは画面や形式が違うので使いません")
+            return None
+        ses = (d["SES"] if "SES" in d.files else np.zeros(len(d["X"]), int)) + 1
+        m = ses <= max_sessions
+        T = d["T"] if "T" in d.files else np.full(len(d["X"]), np.nan)
+        RL = d["L"] if "L" in d.files and len(d["L"]) == len(d["X"]) else np.zeros((len(d["X"]), 478, 3), np.float32)
+        RM = d["M"] if "M" in d.files and len(d["M"]) == len(d["X"]) else np.zeros((len(d["X"]), 4, 4), np.float32)
+        return (d["X"][m], d["Y"][m], d["G"][m], d["P"][m], d["K"][m], T[m], d["PA"][m], ses[m], RL[m], RM[m])
+    except Exception as e:
+        print("前回のデータを読めません:", e)
+        return None
 
 
 def _z0o0(X):
