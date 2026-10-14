@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>Gaze Overlay</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: transparent; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #status { position: fixed; left: 8px; bottom: 8px; font: 12px monospace; color: #fff;
+            background: rgba(0,0,0,.5); padding: 2px 6px; border-radius: 4px; display: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="status"></div>
+<script>
+// URL パラメータ: ?ws=8765&color=00e5ff&size=36&trail=600&debug=1
+const q = new URLSearchParams(location.search);
+const WS_PORT = q.get("ws") || "8765";
+const COLOR   = "#" + (q.get("color") || "00e5ff");
+const SIZE    = parseFloat(q.get("size") || "36");     // リング半径 (px, 1080p 基準)
+const TRAIL_MS = parseInt(q.get("trail") || "600");    // 軌跡を残す時間
+const DEBUG   = q.get("debug") === "1";
+
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+const status = document.getElementById("status");
+if (DEBUG) status.style.display = "block";
+
+function resize() {
+  cv.width = window.innerWidth * devicePixelRatio;
+  cv.height = window.innerHeight * devicePixelRatio;
+}
+window.addEventListener("resize", resize);
+resize();
+
+let hist = [];          // {x, y, t}
+let last = null;        // 最新メッセージ
+let connected = false;
+
+function connect() {
+  const ws = new WebSocket(`ws://localhost:${WS_PORT}/`);
+  ws.onopen = () => { connected = true; };
+  ws.onclose = () => { connected = false; setTimeout(connect, 1000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    last = m;
+    if (m.valid) {
+      const now = performance.now();
+      hist.push({ x: m.x, y: m.y, t: now });
+      while (hist.length && now - hist[0].t > TRAIL_MS) hist.shift();
+    }
+  };
+}
+connect();
+
+let lastSeen = 0;
+function draw() {
+  requestAnimationFrame(draw);
+  const W = cv.width, H = cv.height;
+  const scale = H / 1080;
+  ctx.clearRect(0, 0, W, H);
+
+  const now = performance.now();
+  while (hist.length && now - hist[0].t > TRAIL_MS) hist.shift();
+
+  // 軌跡
+  if (hist.length > 1) {
+    ctx.lineCap = "round"; ctx.lineJoin = "round";
+    for (let i = 1; i < hist.length; i++) {
+      const a = hist[i - 1], b = hist[i];
+      const age = (now - b.t) / TRAIL_MS;
+      ctx.strokeStyle = COLOR;
+      ctx.globalAlpha = 0.6 * (1 - age);
+      ctx.lineWidth = 4 * scale * (1 - age) + 1;
+      ctx.beginPath();
+      ctx.moveTo(a.x * W, a.y * H);
+      ctx.lineTo(b.x * W, b.y * H);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // 現在位置のリング
+  if (last && last.valid) {
+    lastSeen = now;
+  }
+  const fade = Math.max(0, 1 - (now - lastSeen) / 400);   // 顔ロスト・まばたき時にフェード
+  if (hist.length && fade > 0) {
+    const p = hist[hist.length - 1];
+    const x = p.x * W, y = p.y * H, r = SIZE * scale;
+    ctx.globalAlpha = fade;
+    ctx.strokeStyle = COLOR;
+    ctx.lineWidth = 4 * scale;
+    ctx.shadowColor = COLOR; ctx.shadowBlur = 12 * scale;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = COLOR;
+    ctx.beginPath(); ctx.arc(x, y, 4 * scale, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  if (DEBUG) {
+    status.textContent = `${connected ? "connected" : "disconnected"}  ` +
+      (last ? `fps=${last.fps} face=${last.face} blink=${last.blink} ` +
+              (last.valid ? `x=${last.x.toFixed(3)} y=${last.y.toFixed(3)}` : "") : "");
+  }
+}
+draw();
+</script>
+</body>
+</html>

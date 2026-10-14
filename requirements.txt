@@ -1,0 +1,11 @@
+mediapipe>=0.10.14
+opencv-python>=4.9
+numpy
+scikit-learn>=1.4
+joblib
+websockets>=12
+screeninfo
+customtkinter>=5.2
+pillow
+pygrabber
+keyboard
