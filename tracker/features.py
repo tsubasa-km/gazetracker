@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
+
+from . import _mp_compat  # noqa: F401  (mediapipe より先に)
 import mediapipe as mp
 import numpy as np
 from mediapipe.tasks import python as mp_python

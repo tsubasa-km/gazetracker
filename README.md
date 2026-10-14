@@ -8,7 +8,7 @@ Splatoon など、Switch の映像を入力切替で見ながらプレイする�
 | 部品 | 使用技術 | 役割 |
 |---|---|---|
 | 顔・虹彩検出 | MediaPipe Face Landmarker (CPU) | 478 点の顔ランドマーク、虹彩、頭部姿勢 |
-| 視線回帰 | scikit-learn (Ridge) | 左右の虹彩位置の 2 次多項式 + まぶたの開き + 頭部姿勢と距離の積 → 画面座標 (0〜1 に正規化) |
+| 視線回帰 | numpy (Ridge 回帰を自前実装) | 左右の虹彩位置の 2 次多項式 + まぶたの開き + 頭部姿勢と距離の積 → 画面座標 (0〜1 に正規化) |
 | 平滑化 | One Euro Filter | ジッタ除去 |
 | 配信 | websockets + 標準 http.server | OBS ブラウザソースへ座標を送る |
 | オーバーレイ | 透過 HTML/Canvas | リング + 軌跡を描画 |
@@ -28,7 +28,13 @@ Splatoon など、Switch の映像を入力切替で見ながらプレイする�
 | pyw | `setup.bat` を一度実行してから `GazeTracker.pyw` をダブルクリック | コンソール窓なしで起動。`.venv` の Python を自動で使う |
 | bat | `app.bat` | コンソール窓付き。エラーを見たいときに |
 
-exe を自分で作り直すときは `setup.bat` の後に `build_exe.bat` を実行します (数分、約 370MB)。ビルドの最後に自動で署名されます。
+exe を自分で作り直すときは `setup.bat` の後に `build_exe.bat` を実行します (数分、フォルダで約 210MB、配布 zip で約 86MB)。ビルドの最後に自動で署名されます。
+
+サイズを抑えるために次のことをしています。
+- 回帰を numpy で実装し、scikit-learn と SciPy を同梱しない (約 80MB 削減)
+- OpenCV は 4.x 系に固定する (5.0 は本体が 33MB 大きい)
+- OpenCV の動画ファイル用 FFmpeg プラグインを削除する (30MB)。カメラは DirectShow で読むので不要
+- MediaPipe が描画補助のためだけに読み込む matplotlib を同梱せず、空のモジュールで代用する (`tracker/_mp_compat.py`、約 15MB 削減)
 
 ### 別の PC で使う (署名と証明書)
 

@@ -42,8 +42,16 @@ def main():
         for p in (APP_DIR / "profiles").glob("__selftest.*"):
             p.unlink()
         from app import camera_names
+        # カメラ名とモード一覧は別スレッドからも取れること (GUI はスレッドで調べる)
+        import threading
+        from tracker.camera import list_modes
+        res = {}
+        th = threading.Thread(target=lambda: res.update(names=len(camera_names()), modes=list_modes(0) is not None))
+        th.start()
+        th.join()
         print(f"selftest ok model={MODEL_PATH.exists()} engine_started={st.started} fps={st.fps:.1f} "
-              f"error={st.error!r} cameras={len(camera_names())} app_dir={APP_DIR}")
+              f"error={st.error!r} cameras={len(camera_names())} cameras_thread={res.get('names')} "
+              f"modes={res.get('modes')} cam={st.cam_desc!r} app_dir={APP_DIR}")
         return 0 if st.started and not st.error else 1
     import app
     app.App().mainloop()

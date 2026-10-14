@@ -14,13 +14,9 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from sklearn.linear_model import Ridge
-from sklearn.model_selection import GroupKFold, cross_val_predict
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import FunctionTransformer, StandardScaler
 
 from tracker import features as F
-from tracker.model import KIND_MOTION, KIND_STATIC
+from tracker.model import KIND_MOTION, KIND_STATIC, cv_predict
 from tracker.paths import PROFILE_DIR
 
 I = F.IDX
@@ -79,10 +75,12 @@ FEATURE_SETS = {
 
 
 def cv_errors(fs, X, Y, G, K, W, H):
+    A = fs(X)
+    sd = A.std(axis=0)
+    A = (A - A.mean(axis=0)) / np.where(sd > 0, sd, 1)      # 比較用なので標準化する
     best = None
     for alpha in (0.03, 0.1, 0.3, 1, 3, 10, 100):
-        m = make_pipeline(FunctionTransformer(fs), StandardScaler(), Ridge(alpha))
-        pred = cross_val_predict(m, X, Y, groups=G, cv=GroupKFold(min(5, len(np.unique(G)))))
+        pred = cv_predict(A, Y, G, alpha)
         e = np.linalg.norm((pred - Y) * [W, H], axis=1)
         tot = e.mean()
         if best is None or tot < best[0]:

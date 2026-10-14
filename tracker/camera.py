@@ -42,9 +42,22 @@ def _open(index: int, width: int, height: int, fps: int, fourcc):
     return cap
 
 
+def com_init():
+    """このスレッドで COM を初期化する (DirectShow の問い合わせに必要)。
+    カメラは画面とは別のスレッドで調べるため、スレッドごとに呼ぶ必要がある。初期化済みなら何もしない。"""
+    try:
+        import comtypes
+        comtypes.CoInitializeEx(comtypes.COINIT_APARTMENTTHREADED)
+    except OSError:
+        pass          # 別の方式で初期化済み (それでも問い合わせはできる)
+    except Exception:
+        pass
+
+
 def list_modes(index: int):
     """ドライバが申告する対応モード [(形式, 幅, 高さ, 最大fps), ...]。問い合わせできなければ None。"""
     try:
+        com_init()
         from pygrabber.dshow_graph import FilterGraph
         g = FilterGraph()
         g.add_video_input_device(index)

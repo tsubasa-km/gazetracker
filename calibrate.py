@@ -2,7 +2,7 @@
 
 Display1 に Windows 画面を出した状態で実行し、注視点を順に見つめる。
 頭の位置を変えた複数の姿勢 (パス) で集めると、プレイ中に頭が動いても精度が保てる。
-終了後にプロファイル (profiles/<name>.json + .joblib) を保存する。
+終了後にプロファイル (profiles/<name>.json) と生データ (profiles/<name>_calib.npz) を保存する。
 
 例:
   python calibrate.py --list-monitors

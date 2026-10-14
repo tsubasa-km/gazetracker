@@ -33,6 +33,8 @@ ctk.ThemeManager.theme["CTkFont"]["family"] = "Yu Gothic UI"   # 日本語を読
 def camera_names() -> list[str]:
     """DirectShow のデバイス名 (順番は OpenCV の CAP_DSHOW 番号と一致)。"""
     try:
+        from tracker.camera import com_init
+        com_init()
         from pygrabber.dshow_graph import FilterGraph
         return FilterGraph().get_input_devices()
     except Exception:
